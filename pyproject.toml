@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drift-linter"
-version = "0.1.28"
+version = "0.1.29"
 description = "Static linter for the quiet ways code and config fall out of sync"
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Quality Assurance",
 ]
+
+[project.urls]
+Homepage = "https://github.com/rosie-dev-ilands/drift-linter"
+Repository = "https://github.com/rosie-dev-ilands/drift-linter"
+Issues = "https://github.com/rosie-dev-ilands/drift-linter/issues"
 
 [project.scripts]
 drift = "drift:main"

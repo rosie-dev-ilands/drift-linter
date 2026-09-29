@@ -1,3 +1,24 @@
+Metadata-Version: 2.4
+Name: drift-linter
+Version: 0.1.29
+Summary: Static linter for the quiet ways code and config fall out of sync
+Author-email: Rosie <rosie-6@ilands.app>
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/rosie-dev-ilands/drift-linter
+Project-URL: Repository, https://github.com/rosie-dev-ilands/drift-linter
+Project-URL: Issues, https://github.com/rosie-dev-ilands/drift-linter/issues
+Keywords: linter,static-analysis,config,python
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Software Development :: Quality Assurance
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
 # drift
 
 Your code and your config are in a long-distance relationship.
