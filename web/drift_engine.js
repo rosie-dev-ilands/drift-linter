@@ -1,0 +1,3363 @@
+/* drift web engine — a faithful JS port of drift.py's four rules.
+ * Zero dependencies. Runs in browser and node.
+ * API: runDrift({ 'bot.py': code, '.env': envText }) -> { findings, notes }
+ * findings: [{ rule, severity, file, line, message }]
+ */
+(function (root, factory) {
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.driftEngine = factory();
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var VERSION = "0.1.26";
+
+  var SKIP_DIRS = /(^|\/)(\.git|\.hg|\.svn|__pycache__|node_modules|venv|\.venv|\.tox|dist|build|site-packages|\.mypy_cache|\.pytest_cache)(\/|$)/;
+  var CONFIG_NAMES = ["config", "conf", "settings", "cfg", "env", "defaults", "options", "getters", "setters"];
+  var MAGIC_MIN_COUNT = 3;
+  // Schema-call families whose first string argument names a config key
+  // (cfgv: Required / Optional / Conditional* + Recurse variants). Mirror
+  // of Python _SCHEMA_KEY_CALLS (pre-commit FT13).
+  var SCHEMA_KEY_CALLS = ["Required", "Optional", "RequiredRecurse", "OptionalRecurse", "ConditionalRequired", "ConditionalOptional"];
+  var ENV_KEY_RE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
+  var UPPER_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+  // Generated from Python's dir(builtins) — mirrors drift.py's BUILTINS
+  // exactly (the hand-typed list was missing the OSError family, Warning
+  // classes and aliases: `except FileNotFoundError:` / `DeprecationWarning`
+  // false-flagged in the browser engine — dateutil field parity #8).
+  var BUILTINS = (
+    "ArithmeticError AssertionError AttributeError BaseException BaseExceptionGroup BlockingIOError BrokenPipeError BufferError BytesWarning ChildProcessError ConnectionAbortedError ConnectionError " +
+    "ConnectionRefusedError ConnectionResetError DeprecationWarning EOFError Ellipsis EncodingWarning EnvironmentError Exception ExceptionGroup False FileExistsError FileNotFoundError " +
+    "FloatingPointError FutureWarning GeneratorExit IOError ImportError ImportWarning IndentationError IndexError InterruptedError IsADirectoryError KeyError KeyboardInterrupt " +
+    "LookupError MemoryError ModuleNotFoundError NameError None NotADirectoryError NotImplemented NotImplementedError OSError OverflowError PendingDeprecationWarning PermissionError " +
+    "ProcessLookupError RecursionError ReferenceError ResourceWarning RuntimeError RuntimeWarning StopAsyncIteration StopIteration SyntaxError SyntaxWarning SystemError SystemExit " +
+    "TabError TimeoutError True TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError UnicodeTranslateError UnicodeWarning UserWarning ValueError " +
+    "Warning ZeroDivisionError abs aiter all anext any ascii bin bool breakpoint bytearray " +
+    "bytes callable chr classmethod compile complex copyright credits delattr dict dir divmod " +
+    "enumerate eval exec exit filter float format frozenset getattr globals hasattr hash " +
+    "help hex id input int isinstance issubclass iter len license list locals " +
+    "map max memoryview min next object oct open ord pow print property " +
+    "quit range repr reversed round set setattr slice sorted staticmethod str sum " +
+    "super tuple type vars zip").split(" ");
+  var BUILTIN_SET = {};
+  BUILTINS.forEach(function (b) { BUILTIN_SET[b] = 1; });
+
+  // py2 builtins that py3 still provides on some platforms (WindowsError is
+  // an OSError alias on Windows) — deliberate compat names, not typos
+  // (dateutil field test #8 mirror).
+  var COMPAT_NAMES = { "WindowsError": 1 };
+
+  /* ------------------------------------------------------------ tokenizer */
+
+  var KEYWORDS = {};
+  ("False None True and as assert async await break class continue def del elif else except " +
+    "finally for from global if import in is lambda nonlocal not or pass raise return try while " +
+    "with yield").split(" ").forEach(function (k) { KEYWORDS[k] = 1; });
+  // NOTE: `match` / `case` are SOFT keywords in Python (valid identifiers
+  // outside a match statement: `case = 1`, `re.match(...)`, `def case():`).
+  // They stay NAME tokens; parseStatement decides match-statements via
+  // lookahead (v0.1.6).
+
+  var OPS3 = ["**=", "//=", ">>=", "<<=", "..."];
+  var OPS2 = ["**", "//", ">>", "<<", "<=", ">=", "==", "!=", ":=", "->", "+=", "-=", "*=", "/=", "%=", "@=", "&=", "|=", "^="];
+  var OPS1 = "()[]{}:.,;@=+-*/%<>|&^~!";
+
+  function isIdentStart(ch) { return /[A-Za-z_]/.test(ch) || /[\p{L}]/u.test(ch); }
+  function isIdentPart(ch) { return /[A-Za-z0-9_]/.test(ch) || /[\p{L}\p{N}]/u.test(ch); }
+
+  function tokenize(src) {
+    var tokens = [];
+    var line = 1;
+    var i = 0;
+    var n = src.length;
+    var indentStack = [0];
+    var parenDepth = 0;
+    var pendingNewlines = 0;
+    var atLineStart = true;
+    var logicalLineHasContent = false;
+    var lineStartIdx = 0;
+
+    function push(type, value, ln) { tokens.push({ type: type, value: value, line: ln }); }
+
+    function emitNewlines() {
+      if (pendingNewlines > 0) {
+        push("NEWLINE", "\n", line - pendingNewlines + 1);
+        pendingNewlines = 0;
+      }
+    }
+
+    function handleIndent(ln) {
+      // count indentation of current logical line (tabs expanded to 8)
+      var j = lineStartIdx, ws = 0;
+      while (j < n && (src[j] === " " || src[j] === "\t")) {
+        ws += src[j] === "\t" ? 8 - (ws % 8) : 1;
+        j++;
+      }
+      if (j >= n || src[j] === "\n" || src[j] === "\r" || src[j] === "#") {
+        // blank or comment-only line: no indent tokens
+        return;
+      }
+      var cur = indentStack[indentStack.length - 1];
+      if (ws > cur) { indentStack.push(ws); push("INDENT", ws, ln); }
+      else if (ws < cur) {
+        while (indentStack.length > 1 && ws < indentStack[indentStack.length - 1]) {
+          indentStack.pop();
+          push("DEDENT", indentStack[indentStack.length - 1], ln);
+        }
+      }
+    }
+
+    function skipLineEnd() {
+      while (i < n && (src[i] === " " || src[i] === "\t")) i++;
+      while (i < n && src[i] !== "\n") i++; // rest of line (comment)
+      if (i < n && src[i] === "\n") { i++; line++; }
+    }
+
+    while (i < n) {
+      var ch = src[i];
+
+      if (atLineStart && parenDepth === 0) {
+        if (ch === " " || ch === "\t") { i++; continue; }
+        if (ch === "\n") { i++; line++; lineStartIdx = i; continue; }
+        if (ch === "\r") { i++; continue; }
+        if (ch === "#") { skipLineEnd(); lineStartIdx = i; continue; }
+        // real content: emit pending newlines + indent handling
+        emitNewlines();
+        handleIndent(line);
+        atLineStart = false;
+        logicalLineHasContent = true;
+        continue;
+      }
+
+      if (ch === "\n") { line++; i++; if (parenDepth === 0) { pendingNewlines++; atLineStart = true; lineStartIdx = i; } continue; }
+      if (ch === "\r") { i++; continue; }
+      if (ch === " " || ch === "\t") { i++; continue; }
+      if (ch === "#") {
+        // comment: consume the comment text but LEAVE the newline for the
+        // main loop — skipLineEnd() here swallowed it, which killed the
+        // NEWLINE token and the next line's indent processing for
+        // `stmt  # comment` lines (v0.1.5 fix).
+        while (i < n && src[i] !== "\n") i++;
+        continue;
+      }
+      if (ch === "\\") {
+        // explicit line continuation
+        if (i + 1 < n && (src[i + 1] === "\n")) { i += 2; line++; continue; }
+        if (i + 1 < n && src[i + 1] === "\r") { i += 2; continue; }
+        push("OP", "\\", line); i++; continue;
+      }
+
+      var ln = line;
+
+      // strings (two-letter prefixes too: rf/fr/rb/br — the old check only
+      // looked one letter ahead, so rf"..." split into NAME(r) + FSTRING)
+      if (ch === "'" || ch === "\"" || /[rRuUbBfF]/.test(ch) && i + 1 < n && (src[i + 1] === "'" || src[i + 1] === "\""
+          || /[rRuUbBfF]/.test(src[i + 1]) && i + 2 < n && (src[i + 2] === "'" || src[i + 2] === "\""))) {
+        var m = src.slice(i).match(/^([rRuUbBfF]{0,2})(?:'''|"""|'|")/);
+        if (m) {
+          var prefix = (m[1] || "").toLowerCase();
+          var quote = m[0].slice(m[1].length);
+          var triple = quote.length === 3;
+          var q = quote[0];
+          var j = i + m[0].length;
+          var raw = "";
+          var closed = false;
+          var isF = prefix.indexOf("f") !== -1;
+          var isR = prefix.indexOf("r") !== -1;
+          var isB = prefix.indexOf("b") !== -1;
+          while (j < n) {
+            if (triple) {
+              if (src.startsWith(q + q + q, j)) { closed = true; j += 3; break; }
+            } else {
+              if (src[j] === q) {
+                // handle doubled quotes in single-quoted strings ('' escape)
+                if (src[j + 1] === q && !isR) { raw += q; j += 2; continue; }
+                if (isR) {
+                  // raw strings: a quote is escaped iff preceded by an ODD
+                  // number of backslashes (Python: r"\"" is backslash+quote,
+                  // and the string continues). Parity bug from black field
+                  // test #9: r"[\'\"]" closed early, chopped the statement,
+                  // dropped the name binding, and the tail re-tokenized.
+                  var bs = 0, kb = j - 1;
+                  while (kb >= 0 && src[kb] === "\\") { bs++; kb--; }
+                  if (bs % 2 === 1) { raw += src[j]; j += 1; continue; }
+                }
+                closed = true; j += 1; break;
+              }
+            }
+            if (src[j] === "\n") {
+              // triple strings own their newlines; a single-line string that
+              // hits one is UNTERMINATED and must leave the newline for the
+              // outer loop (which counts it and emits NEWLINE). The old code
+              // incremented line here AND in the outer loop -> every later
+              // line drifted +1 (black field test #9: trans.py shifted).
+              if (triple) line++;
+              else break;
+            }
+            if (src[j] === "\\" && !isR && j + 1 < n) {
+              var esc = src[j + 1];
+              if (esc === "\n") { line++; }
+              if (!isF) { raw += "\\" + esc; } else { raw += "\\" + esc; }
+              j += 2;
+              continue;
+            }
+            raw += src[j];
+            j++;
+          }
+          if (!closed && !triple) {
+            // unterminated single-line string: don't consume the newline
+            // rewind to before the quote's end (tokenizer will recover)
+          }
+          var tokKind = "STRING";
+          var kind = isB ? "bytes" : isF ? "fstring" : "str";
+          if (!closed) { kind = "badstr"; }
+          push(tokKind, { raw: raw, kind: kind, prefix: prefix, triple: triple }, ln);
+          i = j;
+          continue;
+        }
+      }
+
+      // numbers
+      if (/[0-9]/.test(ch) || (ch === "." && /[0-9]/.test(src[i + 1] || ""))) {
+        // trailing-dot floats: `1.` and `2., 3.` (pre-commit FT13). The dot is
+        // part of the literal even with no digits after it (`1..hex()` is
+        // (1.).hex()); the scanner used to leave the dot as an attribute OP.
+        var numRe = /^(?:0[xXbBoO][0-9a-fA-F_]+|(?:\d[\d_]*)(?:\.\d[\d_]*|\.)?(?:[eE][+-]?\d[\d_]*)?|\.\d[\d_]*)(?:[jJ])?/;
+        var nm = numRe.exec(src.slice(i));
+        if (nm) {
+          var rawNum = nm[0];
+          var isComplex = /[jJ]$/.test(rawNum);
+          var clean = rawNum.replace(/_/g, "").replace(/[jJ]$/, "");
+          var val;
+          if (/^0[xX]/.test(clean)) val = parseInt(clean, 16);
+          else if (/^0[bB]/.test(clean)) val = parseInt(clean.slice(2), 2);
+          else if (/^0[oO]/.test(clean)) val = parseInt(clean.slice(2), 8);
+          else if (isComplex) val = parseFloat(clean) * 1; // complex: ignored by rules
+          else val = parseFloat(clean);
+          push("NUMBER", { value: val, raw: rawNum, isComplex: isComplex }, ln);
+          i += nm[0].length;
+          continue;
+        }
+      }
+
+      // identifiers / keywords
+      if (isIdentStart(ch)) {
+        var j2 = i;
+        while (j2 < n && isIdentPart(src[j2])) j2++;
+        var word = src.slice(i, j2);
+        push(KEYWORDS[word] ? "KEYWORD" : "NAME", word, ln);
+        i = j2;
+        continue;
+      }
+
+      // operators
+      var three = src.slice(i, i + 3);
+      if (OPS3.indexOf(three) !== -1) { push("OP", three, ln); i += 3; continue; }
+      var two = src.slice(i, i + 2);
+      if (OPS2.indexOf(two) !== -1) { push("OP", two, ln); i += 2; continue; }
+      if (OPS1.indexOf(ch) !== -1) {
+        push("OP", ch, ln);
+        if (ch === "(" || ch === "[" || ch === "{") parenDepth++;
+        else if (ch === ")" || ch === "]" || ch === "}") parenDepth = Math.max(0, parenDepth - 1);
+        i++;
+        continue;
+      }
+
+      // unknown char: skip
+      i++;
+    }
+
+    emitNewlines();
+    while (indentStack.length > 1) { indentStack.pop(); push("DEDENT", 0, line); }
+    push("EOF", null, line);
+    return tokens;
+  }
+
+  /* ------------------------------------------------------------ parser */
+
+  function Parser(tokens) {
+    this.toks = tokens;
+    this.pos = 0;
+    this.notes = [];
+    this.parsedErrors = 0;
+  }
+
+  Parser.prototype.peek = function (off) { return this.toks[Math.min(this.pos + (off || 0), this.toks.length - 1)]; };
+  Parser.prototype.next = function () { return this.toks[this.pos++]; };
+  Parser.prototype.at = function (type, value) {
+    var t = this.peek();
+    if (t.type !== type) return false;
+    if (value !== undefined && t.value !== value) return false;
+    return true;
+  };
+  Parser.prototype.eat = function (type, value) {
+    if (this.at(type, value)) return this.next();
+    return null;
+  };
+  Parser.prototype.expect = function (type, value) {
+    var t = this.next();
+    if (t.type !== type || (value !== undefined && t.value !== value)) {
+      throw new Error("expected " + type + " " + (value || "") + " got " + t.type + " " + JSON.stringify(t.value) + " @line " + t.line);
+    }
+    return t;
+  };
+  Parser.prototype.skipToLineEnd = function () {
+    while (this.peek().type !== "NEWLINE" && this.peek().type !== "EOF" && this.peek().type !== "DEDENT") this.next();
+    if (this.peek().type === "NEWLINE") this.next();
+  };
+  Parser.prototype.isName = function (value) { var t = this.peek(); return t.type === "NAME" && t.value === value; };
+  Parser.prototype.isKw = function (value) { var t = this.peek(); return t.type === "KEYWORD" && t.value === value; };
+
+  Parser.prototype.parseModule = function () {
+    var body = [];
+    while (this.peek().type !== "EOF") {
+      this.parseStatementOrSuite(body);
+    }
+    return { type: "Module", body: body, lineno: 1 };
+  };
+
+  // parse one statement; if a block (INDENT) follows, parse its suite into body too
+  Parser.prototype.parseStatementOrSuite = function (body) {
+    try {
+      var stmts = this.parseSimpleStmt();
+      for (var k = 0; k < stmts.length; k++) body.push(stmts[k]);
+    } catch (e) {
+      this.parsedErrors++;
+      this.skipToLineEnd();
+      // if a block follows the failed statement, consume it so structure survives
+      var depth = 0;
+      while (this.at("INDENT")) { depth++; this.next(); this.parseStatementOrSuite([]); }
+      // each consumed INDENT leaves a matching DEDENT pending; unwind them so
+      // the caller's suite loop resumes at the right level (v0.1.5 fix — the
+      // old recovery leaked DEDENTs and desynced everything after the skip).
+      while (depth > 0 && this.at("DEDENT")) { depth--; this.next(); }
+    }
+    if (this.at("INDENT")) {
+      this.next();
+      var block = [];
+      while (!this.at("DEDENT") && !this.at("EOF")) {
+        this.parseStatementOrSuite(block);
+      }
+      this.expect("DEDENT");
+      for (var b = 0; b < block.length; b++) body.push(block[b]);
+    }
+  };
+
+  // parse statements until NEWLINE (handles ';' separated)
+  Parser.prototype.parseSimpleStmt = function () {
+    var out = [];
+    while (true) {
+      var s = this.parseStatement();
+      if (s) {
+        if (Array.isArray(s)) { for (var i = 0; i < s.length; i++) out.push(s[i]); }
+        else out.push(s);
+      }
+      if (this.eat("OP", ";")) {
+        if (this.at("NEWLINE")) break;
+        continue;
+      }
+      break;
+    }
+    if (this.peek().type === "NEWLINE") this.next();
+    return out;
+  };
+
+  Parser.prototype.parseStatement = function () {
+    var t = this.peek();
+
+    if (t.type === "NEWLINE") { this.next(); return null; }
+
+    // `match` is a soft keyword: a match statement only when the line scans
+    // as `<expr>:` — otherwise it is an ordinary expression (`match = 5`,
+    // `match(x)`, `x = match`).
+    if (t.type === "NAME" && t.value === "match" && this.looksLikeMatchStatement()) {
+      return this.parseMatch(t);
+    }
+
+    if (t.type === "KEYWORD") {
+      switch (t.value) {
+        case "def": return this.parseDef(false);
+        case "async":
+          this.next();
+          if (this.isKw("def")) return this.parseDef(true);
+          if (this.isKw("for")) { var f = this.parseFor(true); return f; }
+          if (this.isKw("with")) { var w = this.parseWith(true); return w; }
+          throw new Error("async what?");
+        case "await":
+          // bare await expression statement: `await asyncio.gather(...)`
+          // (black concurrency.py, v0.1.23 — the KEYWORD switch had no
+          // await case, so the whole line was skipped and the file died
+          // with parsedErrors>0). Await inside assignments/returns already
+          // parses via parseFactor.
+          this.next();
+          return { type: "Expr", value: { type: "Await", value: this.parseFactor(), lineno: t.line }, lineno: t.line };
+        case "class": return this.parseClass();
+        case "import": return this.parseImport();
+        case "from": return this.parseFromImport();
+        case "return":
+          this.next();
+          var rv = null;
+          if (!this.at("NEWLINE") && !this.at("OP", ";") && !this.at("EOF") && !this.at("DEDENT")) {
+            // value may be a star-list: `return a, *b` / `return *a, b`
+            rv = this.parseStarList();
+          }
+          return { type: "Return", value: rv, lineno: t.line };
+        case "if": return this.parseIf();
+        case "elif": return this.parseIf();
+        case "for": return this.parseFor(false);
+        case "while": return this.parseWhile();
+        case "with": return this.parseWith(false);
+        case "try": return this.parseTry();
+        case "raise":
+          this.next();
+          var exc = null;
+          if (!this.at("NEWLINE") && !this.at("OP", ";")) exc = this.parseExpr();
+          var cause = null;
+          if (this.isKw("from")) { this.next(); cause = this.parseExpr(); } // raise ... from exc (v0.1.5)
+          return { type: "Raise", value: exc, cause: cause, lineno: t.line };
+        case "assert":
+          this.next();
+          var aTest = null, aMsg = null;
+          if (!this.at("NEWLINE") && !this.at("OP", ";")) {
+            aTest = this.parseExpr();
+            if (this.eat("OP", ",")) aMsg = this.parseExpr();
+          }
+          return { type: "Assert", value: aTest, msg: aMsg, lineno: t.line };
+        case "pass": this.next(); return { type: "Pass", lineno: t.line };
+        case "break": this.next(); return { type: "Break", lineno: t.line };
+        case "continue": this.next(); return { type: "Continue", lineno: t.line };
+        case "del":
+          this.next();
+          this.parseExprList();
+          return { type: "Delete", lineno: t.line };
+        case "global": case "nonlocal":
+          this.next();
+          while (this.at("NAME")) this.next();
+          return { type: "Global", lineno: t.line };
+        case "yield":
+          // value may be a star-list: `yield a, *b`
+          var yv = this.parseStarList();
+          return { type: "Expr", value: yv, lineno: t.line };
+        default:
+          throw new Error("unhandled keyword " + t.value);
+      }
+    }
+
+    if (t.type === "OP" && t.value === "@") {
+      // decorator(s) then def/class
+      var decos = [];
+      while (this.eat("OP", "@")) {
+        decos.push(this.parseExpr());
+        if (this.peek().type === "NEWLINE") this.next();
+      }
+      if (this.isKw("async")) { this.next(); }
+      if (this.isKw("def")) return this.parseDef(false, decos);
+      if (this.isKw("class")) return this.parseClass(decos);
+      throw new Error("decorator without def/class");
+    }
+
+    // expression statement (possibly assignment)
+    return this.parseExprStatement();
+  };
+
+  function setStore(node) {
+    // mark target positions as Store ctx, mirroring Python's ast
+    if (!node) return node;
+    if (node.type === "Name") { node.ctx = "Store"; return node; }
+    if (node.type === "Attribute") { node.ctx = "Store"; return node; } // value stays Load
+    if (node.type === "Subscript") { node.ctx = "Store"; return node; } // value/slice stay Load
+    if (node.type === "Tuple" || node.type === "List") {
+      node.ctx = "Store";
+      (node.elts || []).forEach(setStore);
+      return node;
+    }
+    if (node.type === "Starred") { setStore(node.value); return node; }
+    return node;
+  }
+
+  // assignable targets: star_expr / arith expr, comma-separated (no comparison,
+  // no ternary) — mirrors what Python's exprlist allows as a target
+  Parser.prototype.parseAssignable = function () {
+    var first;
+    if (this.at("OP", "*")) {
+      this.next();
+      first = { type: "Starred", value: this.parseArith(), lineno: this.peek(-1).line };
+    } else {
+      first = this.parseArith();
+    }
+    if (!this.eat("OP", ",")) return setStore(first);
+    var elts = [first];
+    while (true) {
+      // terminator check BEFORE the next element: a trailing comma can be the
+      // last thing on the target (`for a, in xs:` / `[x for x, in rows]` /
+      // `*rest, = xs` — pre-commit FT13). The old check only ran after eating
+      // a comma, so single-element forms walked into `in`/`=` and skipped the
+      // whole file as unparseable.
+      if (this.at("NEWLINE") || this.at("OP", ";") || this.at("OP", "=") ||
+          this.isKw("in") || this.at("OP", ")") || this.at("OP", "]") ||
+          this.at("OP", "}") || this.at("EOF") || this.at("DEDENT")) break;
+      if (this.at("OP", "*")) {
+        this.next();
+        elts.push({ type: "Starred", value: this.parseArith(), lineno: this.peek(-1).line });
+      } else {
+        elts.push(this.parseArith());
+      }
+      if (!this.eat("OP", ",")) break;
+    }
+    return setStore({ type: "Tuple", elts: elts, ctx: "Store", lineno: first.lineno });
+  };
+
+  // comma-separated full expressions (for value sides)
+  Parser.prototype.parseExprList = function () {
+    var out = [this.parseExpr()];
+    while (this.eat("OP", ",")) {
+      if (this.at("NEWLINE") || this.at("OP", ";")) break;
+      out.push(this.parseExpr());
+    }
+    return out;
+  };
+
+  // one element of a value-side comma list: `*expr` is legal wherever the
+  // grammar allows star_expressions (tuple displays, call args, iterables)
+  Parser.prototype.parseExprOrStar = function () {
+    if (this.at("OP", "*")) {
+      this.next();
+      return { type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line };
+    }
+    return this.parseExpr();
+  };
+
+  // testlist_star_expr continuation: a comma tail turns a value into an
+  // implicit tuple display, and later elements may be starred. The JS parser
+  // used to parse assignment/return/yield RHS as a single expression, so any
+  // bare comma list after `=` threw and the WHOLE FILE was skipped as clean:
+  // `args = pos, *rest` (tomli/_parser.py:117) and even plain `x = 1, 2`
+  // (review F1). A trailing comma forms a one-element tuple (`x = 1,`).
+  // Terminators stop the list where the enclosing construct ends.
+  Parser.prototype.starListFrom = function (first) {
+    if (!this.eat("OP", ",")) return first;
+    var elts = [first];
+    while (true) {
+      if (this.at("NEWLINE") || this.at("OP", ";") || this.at("DEDENT") ||
+          this.at("EOF") || this.at("OP", ":") || this.at("OP", ")") ||
+          this.at("OP", "]") || this.at("OP", "}")) break;
+      elts.push(this.parseExprOrStar());
+      if (!this.eat("OP", ",")) break;
+    }
+    return { type: "Tuple", elts: elts, ctx: "Load", lineno: first.lineno };
+  };
+
+  // full value-side comma list (star-led or not)
+  Parser.prototype.parseStarList = function () {
+    return this.starListFrom(this.parseExprOrStar());
+  };
+
+  Parser.prototype.parseExprStatement = function () {
+    var ln = this.peek().line;
+    if (this.at("OP", "*")) {
+      // starred assignment target: *rest = xs / *_, most = xs — parseExpr
+      // can't start at `*`, so the statement used to throw and the whole
+      // line was skipped, losing the binding (blib2to3/pgen2/parse.py:
+      // `*_, most_successful_ilabel = self._dead_ilabels` phantom-flagged
+      // `most` — black src tree, field parity #10).
+      var starTargets = [this.parseAssignable()];
+      this.expect("OP", "=");
+      var starValue;
+      while (true) {
+        // RHS is a star-list: `*rest = a, *b` binds rest to a tuple
+        starValue = this.parseStarList();
+        if (!this.at("OP", "=")) break;
+        this.next();
+        starTargets.push(setStore(starValue));
+      }
+      return { type: "Assign", targets: starTargets, value: starValue, lineno: ln };
+    }
+    var first = this.parseExpr();
+    var t = this.peek();
+
+    if (t.type === "OP" && t.value === ",") {
+      // tuple expression or tuple assignment
+      var elts = [first];
+      while (this.eat("OP", ",")) {
+        // `x, = f()` / `a, b, = f()` — trailing comma on a tuple target
+        // (pre-commit FT13). Without the `=` stop the element loop ran into
+        // the `=` and the whole file was skipped as unparseable.
+        if (this.at("NEWLINE") || this.at("OP", ";") || this.at("OP", "=")) break;
+        if (this.at("OP", "*")) {
+          // `ilabel, *rest = xs` — the star used to throw inside parseExpr
+          // (only handled in literals/calls), skipping the line and losing
+          // the binding (blib2to3/pgen2/parse.py phantom `rest`).
+          this.next();
+          elts.push({ type: "Starred", value: this.parseArith(), lineno: this.peek(-1).line });
+        } else {
+          elts.push(this.parseExpr());
+        }
+      }
+      if (this.at("OP", "=")) {
+        this.next();
+        var tupTarget = setStore({ type: "Tuple", elts: elts, ctx: "Store", lineno: ln });
+        var targets = [tupTarget];
+        var value;
+        // RHS is a star-list (implicit tuple allowed): `a, b = c, *d`.
+        // Chained assignment: `a, b = c = expr` — the tuple branch used to
+        // stop at the first `=`, dropping the chain tail (middle name left
+        // unbound, RHS literals uncounted — dateutil's `MO, TU, ... SU =
+        // weekdays = tuple(...)` lost its range(7) and phantom-flagged
+        // `weekdays`; field parity #8).
+        while (true) {
+          value = this.parseStarList();
+          if (!this.at("OP", "=")) break;
+          this.next();
+          targets.push(setStore(value));
+        }
+        return { type: "Assign", targets: targets, value: value, lineno: ln };
+      }
+      return { type: "Expr", value: { type: "Tuple", elts: elts, ctx: "Load", lineno: ln }, lineno: ln };
+    }
+
+    if (t.type === "OP" && t.value === "=") {
+      var targets = [setStore(first)];
+      this.next();
+      var value;
+      // RHS is a star-list: `x = 1, 2` / `x = a, *b` / `x = *a, b` bind an
+      // implicit tuple; chain intermediates stay single expressions
+      // (`x = y = 1, 2` binds both names to the tuple).
+      while (true) {
+        value = this.parseStarList();
+        if (!this.at("OP", "=")) break;
+        this.next();
+        targets.push(setStore(value));
+      }
+      return { type: "Assign", targets: targets, value: value, lineno: ln };
+    }
+    if (t.type === "OP" && /^(\+=|-=|\*=|\/=|\/\/=|%=|\*\*=|&=|\|=|\^=|<<=|>>=|@=)$/.test(t.value)) {
+      var op = t.value.slice(0, -1);
+      this.next();
+      // parse-level: `x += 1, 2` is a Tuple value (compile rejects, ast accepts)
+      return { type: "AugAssign", target: setStore(first), op: op, value: this.parseStarList(), lineno: ln };
+    }
+    if (t.type === "OP" && t.value === ":") {
+      // annotated assignment
+      this.next();
+      var ann = this.parseExpr();
+      var val = null;
+      if (this.eat("OP", "=")) val = this.parseStarList();
+      return { type: "AnnAssign", target: setStore(first), annotation: ann, value: val, lineno: ln };
+    }
+    return { type: "Expr", value: first, lineno: ln };
+  };
+
+  Parser.prototype.parseDef = function (isAsync, decorators) {
+    var kw = this.expect("KEYWORD", "def");
+    var name = this.expect("NAME").value;
+    this.expect("OP", "(");
+    var args = this.parseArgs();
+    this.expect("OP", ")");
+    if (this.eat("OP", "->")) this.parseExpr(); // return annotation
+    this.expect("OP", ":");
+    var node = { type: isAsync ? "AsyncFunctionDef" : "FunctionDef", name: name, args: args, body: [], lineno: kw.line };
+    if (decorators) node.decorators = decorators;
+    this.parseSuiteInto(node.body);
+    return node;
+  };
+
+  Parser.prototype.parseClass = function (decorators) {
+    var kw = this.expect("KEYWORD", "class");
+    var name = this.expect("NAME").value;
+    var bases = [];
+    var keywords = [];
+    if (this.eat("OP", "(")) {
+      while (!this.at("OP", ")")) {
+        var baseExpr = this.parseExpr();
+        if (this.eat("OP", "=")) {
+          // Class keyword argument (`total=False`, `metaclass=M`): Python
+          // keeps these in ClassDef.keywords, not bases. Stored so the
+          // walker sees their values; never treated as a base. Failing on
+          // the `=` skipped whole files (click/pyjwt/black field sweep).
+          keywords.push({ arg: baseExpr.type === "Name" ? baseExpr.id : null,
+                          value: this.parseExpr(), lineno: kw.line });
+        } else {
+          bases.push(baseExpr);
+        }
+        if (!this.eat("OP", ",")) break;
+      }
+      this.expect("OP", ")");
+    }
+    this.expect("OP", ":");
+    var node = { type: "ClassDef", name: name, bases: bases, keywords: keywords, body: [], lineno: kw.line };
+    if (decorators) node.decorators = decorators;
+    this.parseSuiteInto(node.body);
+    return node;
+  };
+
+  Parser.prototype.parseArgs = function (isLambda) {
+    // positional-only via '/', keyword-only via '*'; defaults + annotations allowed.
+    // isLambda: Python lambda params cannot carry annotations, so the first `:`
+    // after the last param is the body separator, not an annotation (v0.1.5).
+    var args = { posonly: [], args: [], kwonly: [], vararg: null, kwarg: null, defaults: [], kw_defaults: [] };
+    var sawSlash = false, sawStar = false, preSlash = [];
+    while (true) {
+      if (this.at("OP", ")")) break;
+      if (this.eat("OP", "/")) { sawSlash = true; if (this.at("OP", ",")) this.next(); continue; }
+      if (this.at("OP", "*")) {
+        this.next();
+        sawStar = true;
+        if (this.at("OP", "**")) { this.next(); args.kwarg = this.expect("NAME").value; if (!isLambda && this.eat("OP", ":")) this.parseExpr(); this.eat("OP", ","); continue; } // **kwargs: Ann, (v0.1.23: trailing comma after annotation)
+        if (this.at("NAME")) { args.vararg = this.next().value; if (!isLambda && this.eat("OP", ":")) this.parseExpr(); } // *args: Ann
+        if (this.at("OP", ",")) { this.next(); } // bare * separator
+        continue; // everything after is keyword-only
+      }
+      if (this.eat("OP", "**")) { args.kwarg = this.expect("NAME").value; if (!isLambda && this.eat("OP", ":")) this.parseExpr(); this.eat("OP", ","); continue; } // **kwargs: Ann, (isort FT11: parse died on the trailing comma, whole file skipped)
+      if (this.at("NAME")) {
+        var nm = this.next().value;
+        if (!isLambda && this.eat("OP", ":")) this.parseExpr(); // annotation
+        if (this.eat("OP", "=")) {
+          // store defaults (click field test: JS dropped them, so the
+          // engine couldn't see width=36 — or exempt it from R3).
+          var dflt = this.parseExpr();
+          if (sawStar || args.vararg || args.kwarg) args.kw_defaults.push(dflt);
+          else args.defaults.push(dflt);
+        }
+        if (sawStar || args.vararg || args.kwarg) args.kwonly.push(nm);
+        else if (sawSlash) args.args.push(nm);
+        else preSlash.push(nm);
+        if (this.eat("OP", ",")) continue;
+        if (this.at("OP", ")")) break;
+        continue;
+      }
+      break;
+    }
+    if (sawSlash) args.posonly = preSlash;
+    else args.args = preSlash.concat(args.args);
+    return args;
+  };
+
+  Parser.prototype.parseImport = function () {
+    var kw = this.expect("KEYWORD", "import");
+    var names = [];
+    while (true) {
+      var parts = [this.expect("NAME").value];
+      while (this.eat("OP", ".")) parts.push(this.expect("NAME").value);
+      var asname = null;
+      if (this.isKw("as")) { this.next(); asname = this.expect("NAME").value; }
+      names.push({ name: parts.join("."), asname: asname });
+      if (!this.eat("OP", ",")) break;
+    }
+    return { type: "Import", names: names, lineno: kw.line };
+  };
+
+  Parser.prototype.parseFromImport = function () {
+    var kw = this.expect("KEYWORD", "from");
+    var parts = [];
+    var dots = 0;
+    while (this.eat("OP", ".")) dots++;
+    while (this.at("NAME")) {
+      parts.push(this.next().value);
+      if (!this.eat("OP", ".")) break;
+    }
+    this.expect("KEYWORD", "import");
+    var names = [];
+    var star = false;
+    if (this.eat("OP", "*")) { star = true; }
+    else {
+      var paren = this.eat("OP", "("); // `from x import (a, b)` (v0.1.5)
+      while (true) {
+        if (paren && this.at("OP", ")")) break;
+        var nm = this.expect("NAME").value;
+        var asname = null;
+        if (this.isKw("as")) { this.next(); asname = this.expect("NAME").value; }
+        names.push({ name: nm, asname: asname });
+        if (!this.eat("OP", ",")) break;
+      }
+      if (paren) this.expect("OP", ")");
+    }
+    return { type: "ImportFrom", module: parts.join("."), dots: dots, names: names, star: star, lineno: kw.line };
+  };
+
+  Parser.prototype.parseIf = function () {
+    var kw = this.expect("KEYWORD"); // if or elif
+    var test = this.parseExpr();
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    var orelse = [];
+    if (this.isKw("elif")) {
+      orelse.push(this.parseIf());
+    } else if (this.isKw("else")) {
+      this.next();
+      this.expect("OP", ":");
+      this.parseSuiteInto(orelse);
+    }
+    return { type: "If", test: test, body: body, orelse: orelse, lineno: kw.line };
+  };
+
+  Parser.prototype.parseWhile = function () {
+    var kw = this.expect("KEYWORD", "while");
+    var test = this.parseExpr();
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    var orelse = [];
+    if (this.isKw("else")) { this.next(); this.expect("OP", ":"); this.parseSuiteInto(orelse); }
+    return { type: "While", test: test, body: body, orelse: orelse, lineno: kw.line };
+  };
+
+  Parser.prototype.parseFor = function (isAsync) {
+    var kw = this.expect("KEYWORD", "for");
+    var target = this.parseAssignable();
+    this.expect("KEYWORD", "in");
+    // iterable is a star-list: `for x in a, b:` iter is a Tuple in Python's
+    // ast (v0.1.11: bare single iter must stay a node or loads inside it are
+    // invisible to walk()); `for x in a, *b:` elements may be starred.
+    var iter = this.parseStarList();
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    var orelse = [];
+    if (this.isKw("else")) { this.next(); this.expect("OP", ":"); this.parseSuiteInto(orelse); }
+    return { type: "For", target: target, iter: iter, body: body, orelse: orelse, lineno: kw.line, isAsync: isAsync };
+  };
+
+  Parser.prototype.parseWith = function (isAsync) {
+    var kw = this.expect("KEYWORD", "with");
+    var items = null;
+    if (this.at("OP", "(")) {
+      // Parenthesized with-item list (`with (\n  open(a) as f,\n  open(b),\n):`).
+      // Python's grammar wants this form FIRST: items split on commas, never
+      // a tuple. `with (x) as f:` is the other reading (parens just group),
+      // so backtrack when the parenthesized form doesn't reach the `:`.
+      // Before this, whole files were skipped in the click/pyjwt/black sweep.
+      var save = this.pos;
+      try {
+        this.next(); // (
+        var pItems = [];
+        while (true) {
+          var pCtx = this.parseExpr();
+          var pV = null;
+          if (this.isKw("as")) { this.next(); pV = setStore(this.parseArith()); }
+          pItems.push({ context_expr: pCtx, optional_vars: pV });
+          if (!this.eat("OP", ",")) break;
+          if (this.at("OP", ")")) break;
+        }
+        if (this.at("OP", ")") && this.peek(1)
+            && this.peek(1).type === "OP" && this.peek(1).value === ":") {
+          this.next(); // )
+          items = pItems;
+        } else {
+          this.pos = save;
+        }
+      } catch (e) { this.pos = save; }
+    }
+    if (!items) {
+      items = [];
+      while (true) {
+        var ctx = this.parseExpr();
+        var v = null;
+        if (this.isKw("as")) { this.next(); v = setStore(this.parseArith()); } // single target, not a comma list
+        items.push({ context_expr: ctx, optional_vars: v });
+        if (!this.eat("OP", ",")) break;
+      }
+    }
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    return { type: "With", items: items, body: body, lineno: kw.line, isAsync: isAsync };
+  };
+
+  /* ----------------------------- match statements (v0.1.6) */
+
+  // Scan ahead on the current logical line: is this `<expr>:` at depth 0?
+  // That is what distinguishes `match x:` (statement) from `match(x)` (call)
+  // or `match = 5` (assignment) — match/case are soft keywords.
+  Parser.prototype.looksLikeMatchStatement = function () {
+    var depth = 0;
+    var last = null;
+    for (var i = this.pos + 1; i < this.toks.length; i++) {
+      var t = this.toks[i];
+      if (t.type === "NEWLINE" || t.type === "EOF" || t.type === "INDENT" || t.type === "DEDENT") {
+        if (depth === 0) break;
+        continue;
+      }
+      if (t.type === "OP") {
+        if (t.value === "(" || t.value === "[" || t.value === "{") { depth++; last = t; continue; }
+        if (t.value === ")" || t.value === "]" || t.value === "}") { depth = Math.max(0, depth - 1); last = t; continue; }
+      }
+      last = t;
+    }
+    return last !== null && last.type === "OP" && last.value === ":";
+  };
+
+  Parser.prototype.parseMatch = function (kw) {
+    this.next(); // 'match'
+    var subject = this.parseExpr();
+    if (this.eat("OP", ",")) {
+      // tuple subject: `match a, b:`
+      var elts = [subject];
+      while (true) {
+        if (this.at("NEWLINE") || this.at("OP", ";")) break;
+        elts.push(this.parseExpr());
+        if (!this.eat("OP", ",")) break;
+      }
+      subject = { type: "Tuple", elts: elts, ctx: "Load", lineno: subject.lineno };
+    }
+    this.expect("OP", ":");
+    if (!this.at("NEWLINE") || !this.peek(1) || this.peek(1).type !== "INDENT") {
+      throw new Error("match requires an indented block");
+    }
+    this.next(); // NEWLINE
+    this.next(); // INDENT
+    var cases = [];
+    while (!this.at("DEDENT") && !this.at("EOF")) {
+      cases.push(this.parseCase());
+    }
+    this.expect("DEDENT");
+    return { type: "Match", subject: subject, cases: cases, lineno: kw.line };
+  };
+
+  Parser.prototype.parseCase = function () {
+    var t = this.peek();
+    if (t.type !== "NAME" || t.value !== "case") throw new Error("expected 'case'");
+    this.next();
+    var pattern = this.parsePattern();
+    if (this.eat("OP", ",")) {
+      // open sequence pattern: `case host, *_ if ...:` — comma-separated
+      // patterns at top level, no brackets (each element may be a star).
+      var elts = [pattern];
+      while (true) {
+        if (this.at("OP", "*")) {
+          this.next();
+          var st = this.peek();
+          if (st.type !== "NAME") throw new Error("expected name after '*' in pattern");
+          this.next();
+          elts.push({ type: "MatchStar", name: st.value, lineno: st.line });
+        } else {
+          elts.push(this.parsePattern());
+        }
+        if (!this.eat("OP", ",")) break;
+      }
+      pattern = { type: "MatchSequence", patterns: elts, lineno: pattern.lineno };
+    }
+    var guard = null;
+    if (this.isKw("if")) { this.next(); guard = this.parseExpr(); }
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    var caps = [];
+    _patternCaptures(pattern, caps);
+    return { type: "Case", pattern: pattern, guard: guard, body: body, captures: caps, lineno: t.line };
+  };
+
+  // pattern = or_pattern ['as' NAME]
+  Parser.prototype.parsePattern = function () {
+    var first = this.parseClosePattern();
+    var parts = [first];
+    while (this.eat("OP", "|")) parts.push(this.parseClosePattern());
+    var node = parts.length === 1 ? first : { type: "MatchOr", patterns: parts, lineno: first.lineno };
+    if (this.isKw("as")) {
+      this.next();
+      var cap = this.peek();
+      if (cap.type !== "NAME") throw new Error("expected capture name after 'as'");
+      this.next();
+      node = { type: "MatchAs", pattern: node, name: cap.value, lineno: first.lineno };
+    }
+    return node;
+  };
+
+  // close_pattern: '(' pattern ')' | irrefutable_pattern
+  Parser.prototype.parseClosePattern = function () {
+    var t = this.peek();
+    if (t.type === "OP" && t.value === "(") {
+      // `(a)` groups; `(a, b)` / `()` are sequence patterns. Peek for a
+      // top-level comma before the matching paren.
+      if (this.peek(1).type === "OP" && this.peek(1).value === ")") return this.parseSequencePattern(t);
+      var depth = 0, isSeq = false;
+      for (var i = this.pos + 1; i < this.toks.length; i++) {
+        var x = this.toks[i];
+        if (x.type === "NEWLINE" || x.type === "EOF") break;
+        if (x.type !== "OP") continue;
+        if (x.value === "(" || x.value === "[" || x.value === "{") depth++;
+        else if (x.value === ")" || x.value === "]" || x.value === "}") {
+          if (depth === 0) break;
+          depth--;
+        } else if (x.value === "," && depth === 0) { isSeq = true; break; }
+      }
+      if (isSeq) return this.parseSequencePattern(t);
+      this.next();
+      var inner = this.parsePattern();
+      this.expect("OP", ")");
+      return inner;
+    }
+    return this.parseIrrefutablePattern();
+  };
+
+  Parser.prototype.parseIrrefutablePattern = function () {
+    var t = this.peek();
+    // `_` wildcard
+    if (t.type === "NAME" && t.value === "_") {
+      this.next();
+      return { type: "MatchAs", pattern: null, name: null, lineno: t.line };
+    }
+    // literals: numbers (incl. -x), strings, None/True/False, Ellipsis
+    if (t.type === "OP" && t.value === "-") {
+      var nx = this.peek(1);
+      if (nx.type === "NUMBER") {
+        this.next(); this.next();
+        return { type: "MatchValue", value: { type: "Constant", value: -nx.value.value, kind: "num", raw: "-" + nx.value.raw, lineno: t.line }, lineno: t.line };
+      }
+      throw new Error("bad literal pattern");
+    }
+    if (t.type === "NUMBER") {
+      this.next();
+      return { type: "MatchValue", value: { type: "Constant", value: t.value.value, kind: "num", raw: t.value.raw, lineno: t.line }, lineno: t.line };
+    }
+    if (t.type === "STRING") {
+      this.next();
+      if (t.value.kind === "fstring") throw new Error("f-string not allowed in pattern");
+      return { type: "MatchValue", value: { type: "Constant", value: decodeString(t.value.raw, t.value.prefix), kind: t.value.kind === "bytes" ? "bytes" : "str", lineno: t.line }, lineno: t.line };
+    }
+    if (t.type === "KEYWORD" && (t.value === "None" || t.value === "True" || t.value === "False")) {
+      this.next();
+      return { type: "MatchValue", value: { type: "Constant", value: t.value === "None" ? null : t.value === "True", kind: "none", lineno: t.line }, lineno: t.line };
+    }
+    if (t.type === "OP" && t.value === "...") {
+      this.next();
+      return { type: "MatchValue", value: { type: "Constant", value: "...", kind: "ellipsis", lineno: t.line }, lineno: t.line };
+    }
+    if (t.type === "OP" && (t.value === "[" || t.value === "(")) {
+      return this.parseSequencePattern(t);
+    }
+    if (t.type === "OP" && t.value === "{") {
+      return this.parseMappingPattern(t);
+    }
+    if (t.type === "NAME") {
+      this.next();
+      if (this.at("OP", ".")) {
+        // dotted value pattern: Color.RED is a LOAD, not a capture
+        var chain = { type: "Name", id: t.value, ctx: "Load", lineno: t.line };
+        while (this.eat("OP", ".")) {
+          var n = this.peek();
+          if (n.type !== "NAME") throw new Error("bad dotted value pattern");
+          this.next();
+          chain = { type: "Attribute", value: chain, attr: n.value, ctx: "Load", lineno: t.line };
+        }
+        return { type: "MatchValue", value: chain, lineno: t.line };
+      }
+      if (this.at("OP", "(")) return this.parseClassPattern(t);
+      // plain capture
+      return { type: "MatchAs", pattern: null, name: t.value, lineno: t.line };
+    }
+    throw new Error("unexpected token in pattern: " + t.type + " " + t.value);
+  };
+
+  Parser.prototype.parseSequencePattern = function (openTok) {
+    var open = openTok.value;
+    var close = open === "[" ? "]" : ")";
+    this.next();
+    var elts = [];
+    if (this.at("OP", close)) { this.next(); return { type: "MatchSequence", patterns: elts, lineno: openTok.line }; }
+    while (true) {
+      if (this.at("OP", "*")) {
+        this.next();
+        var st = this.peek();
+        if (st.type !== "NAME") throw new Error("expected name after '*' in pattern");
+        this.next();
+        elts.push({ type: "MatchStar", name: st.value, lineno: st.line });
+      } else {
+        elts.push(this.parsePattern());
+      }
+      if (this.eat("OP", ",")) {
+        if (this.at("OP", close)) { this.next(); break; }
+        continue;
+      }
+      this.expect("OP", close);
+      break;
+    }
+    return { type: "MatchSequence", patterns: elts, lineno: openTok.line };
+  };
+
+  Parser.prototype.parseMappingPattern = function (openTok) {
+    this.next();
+    var keys = [], pats = [], rest = null;
+    if (this.at("OP", "}")) { this.next(); return { type: "MatchMapping", keys: keys, patterns: pats, rest: rest, lineno: openTok.line }; }
+    while (true) {
+      if (this.at("OP", "**")) {
+        this.next();
+        var rn = this.peek();
+        if (rn.type !== "NAME") throw new Error("expected name after '**' in mapping pattern");
+        this.next();
+        rest = rn.value;
+        if (this.eat("OP", ",")) {
+          if (this.at("OP", "}")) { this.next(); break; }
+        } else {
+          this.expect("OP", "}");
+          break;
+        }
+      }
+      keys.push(this.parseMappingKey());
+      this.expect("OP", ":");
+      pats.push(this.parsePattern());
+      if (this.eat("OP", ",")) {
+        if (this.at("OP", "}")) { this.next(); break; }
+        continue;
+      }
+      this.expect("OP", "}");
+      break;
+    }
+    return { type: "MatchMapping", keys: keys, patterns: pats, rest: rest, lineno: openTok.line };
+  };
+
+  // mapping keys are literal or value patterns — never captures, but dotted
+  // keys DO load their root name (`{Color.RED: x}` loads Color).
+  Parser.prototype.parseMappingKey = function () {
+    var t = this.peek();
+    if (t.type === "OP" && t.value === "-") {
+      var nx = this.peek(1);
+      if (nx.type !== "NUMBER") throw new Error("bad mapping key");
+      this.next(); this.next();
+      return { type: "Constant", value: -nx.value.value, kind: "num", raw: "-" + nx.value.raw, lineno: t.line };
+    }
+    if (t.type === "NUMBER") { this.next(); return { type: "Constant", value: t.value.value, kind: "num", raw: t.value.raw, lineno: t.line }; }
+    if (t.type === "STRING") {
+      this.next();
+      if (t.value.kind === "fstring") throw new Error("f-string not allowed in pattern");
+      return { type: "Constant", value: decodeString(t.value.raw, t.value.prefix), kind: t.value.kind === "bytes" ? "bytes" : "str", lineno: t.line };
+    }
+    if (t.type === "KEYWORD" && (t.value === "None" || t.value === "True" || t.value === "False")) {
+      this.next();
+      return { type: "Constant", value: t.value === "None" ? null : t.value === "True", kind: "none", lineno: t.line };
+    }
+    if (t.type === "OP" && t.value === "...") { this.next(); return { type: "Constant", value: "...", kind: "ellipsis", lineno: t.line }; }
+    if (t.type === "NAME") {
+      this.next();
+      var chain = { type: "Name", id: t.value, ctx: "Load", lineno: t.line };
+      while (this.eat("OP", ".")) {
+        var n = this.peek();
+        if (n.type !== "NAME") throw new Error("bad dotted mapping key");
+        this.next();
+        chain = { type: "Attribute", value: chain, attr: n.value, ctx: "Load", lineno: t.line };
+      }
+      return { type: "MatchValue", value: chain, lineno: t.line };
+    }
+    throw new Error("bad mapping key: " + t.type + " " + t.value);
+  };
+
+  Parser.prototype.parseClassPattern = function (nameTok) {
+    this.next(); // '('
+    var patterns = [], kwdAttrs = [], kwdPatterns = [];
+    if (!this.at("OP", ")")) {
+      while (true) {
+        var t2 = this.peek();
+        var nxt = this.peek(1);
+        if (t2.type === "NAME" && nxt.type === "OP" && nxt.value === "=") {
+          // keyword pattern: Point(x=px) — x is an attr name, not a binding
+          this.next(); this.next();
+          kwdAttrs.push(t2.value);
+          kwdPatterns.push(this.parsePattern());
+        } else {
+          patterns.push(this.parsePattern());
+        }
+        if (this.eat("OP", ",")) {
+          if (this.at("OP", ")")) { this.next(); break; }
+          continue;
+        }
+        this.expect("OP", ")");
+        break;
+      }
+    } else {
+      this.next();
+    }
+    return {
+      type: "MatchClass",
+      cls: { type: "Name", id: nameTok.value, ctx: "Load", lineno: nameTok.line },
+      patterns: patterns, kwd_attrs: kwdAttrs, kwd_patterns: kwdPatterns,
+      lineno: nameTok.line,
+    };
+  };
+
+  Parser.prototype.parseTry = function () {
+    var kw = this.expect("KEYWORD", "try");
+    this.expect("OP", ":");
+    var body = [];
+    this.parseSuiteInto(body);
+    var handlers = [];
+    var orelse = [];
+    var finalbody = [];
+    while (this.isKw("except")) {
+      this.next();
+      var etype = null;
+      if (!this.at("OP", ":") && !this.at("NEWLINE")) etype = this.parseExpr();
+      var ename = null;
+      if (this.isKw("as")) { this.next(); ename = this.expect("NAME").value; }
+      this.expect("OP", ":");
+      var hb = [];
+      this.parseSuiteInto(hb);
+      handlers.push({ type: "ExceptHandler", name: ename, body: hb, lineno: kw.line });
+    }
+    if (this.isKw("else")) { this.next(); this.expect("OP", ":"); this.parseSuiteInto(orelse); }
+    if (this.isKw("finally")) { this.next(); this.expect("OP", ":"); this.parseSuiteInto(finalbody); }
+    return { type: "Try", body: body, handlers: handlers, orelse: orelse, finalbody: finalbody, lineno: kw.line };
+  };
+
+  Parser.prototype.parseSuiteInto = function (body) {
+    if (this.at("NEWLINE")) {
+      this.next();
+      if (this.at("INDENT")) {
+        this.next();
+        while (!this.at("DEDENT") && !this.at("EOF")) this.parseStatementOrSuite(body);
+        this.expect("DEDENT");
+      } else {
+        var s = this.parseSimpleStmt();
+        for (var i = 0; i < s.length; i++) body.push(s[i]);
+      }
+    } else {
+      var st = this.parseSimpleStmt();
+      for (var j = 0; j < st.length; j++) body.push(st[j]);
+    }
+  };
+
+  /* ----------------------------- expressions (Pratt) */
+
+  Parser.prototype.parseExpr = function () {
+    var t = this.peek();
+    if (t.type === "KEYWORD" && t.value === "lambda") return this.parseLambda();
+    if (t.type === "KEYWORD" && t.value === "yield") {
+      this.next();
+      var yv = null;
+      if (this.isKw("from")) { this.next(); yv = { type: "YieldFrom", value: this.parseExpr() }; }
+      else if (!this.at("NEWLINE") && !this.at("OP", ")") && !this.at("OP", "]") && !this.at("OP", "}") && !this.at("OP", ",") && !this.at("OP", ":")) {
+        yv = this.parseExpr();
+      }
+      return { type: "Yield", value: yv, lineno: t.line };
+    }
+    var e = this.parseOrTest();
+    // ternary
+    if (this.isKw("if")) {
+      var ln = e.lineno;
+      this.next();
+      var cond = this.parseOrTest();
+      this.expect("KEYWORD", "else");
+      var orelse = this.parseExpr();
+      return { type: "IfExp", test: cond, body: e, orelse: orelse, lineno: ln };
+    }
+    // walrus (permissive)
+    if (this.at("OP", ":=")) {
+      this.next();
+      var v = this.parseExpr();
+      return { type: "NamedExpr", target: setStore(e), value: v, lineno: e.lineno };
+    }
+    return e;
+  };
+
+  Parser.prototype.parseLambda = function () {
+    var kw = this.expect("KEYWORD", "lambda");
+    var args = { posonly: [], args: [], kwonly: [], vararg: null, kwarg: null };
+    if (!this.at("OP", ":")) {
+      var saved = this.parseArgs(true);
+      args = saved;
+    }
+    this.expect("OP", ":");
+    var body = this.parseExpr();
+    return { type: "Lambda", args: args, body: body, lineno: kw.line };
+  };
+
+  Parser.prototype.parseOrTest = function () {
+    var vals = [this.parseAndTest()];
+    while (this.isKw("or")) { this.next(); vals.push(this.parseAndTest()); }
+    if (vals.length === 1) return vals[0];
+    return { type: "BoolOp", op: "or", values: vals, lineno: vals[0].lineno };
+  };
+
+  Parser.prototype.parseAndTest = function () {
+    var vals = [this.parseNotTest()];
+    while (this.isKw("and")) { this.next(); vals.push(this.parseNotTest()); }
+    if (vals.length === 1) return vals[0];
+    return { type: "BoolOp", op: "and", values: vals, lineno: vals[0].lineno };
+  };
+
+  Parser.prototype.parseNotTest = function () {
+    if (this.isKw("not")) {
+      var t = this.next();
+      return { type: "UnaryOp", op: "not", operand: this.parseNotTest(), lineno: t.line };
+    }
+    return this.parseComparison();
+  };
+
+  var COMP_OPS = { "<": 1, ">": 1, "<=": 1, ">=": 1, "==": 1, "!=": 1, "in": 1, "not": 1, "is": 1 };
+
+  Parser.prototype.parseComparison = function () {
+    var left = this.parsePipe();
+    var ops = [];
+    var comps = [];
+    while (true) {
+      var t = this.peek();
+      if (t.type === "OP" && COMP_OPS[t.value]) {
+        this.next();
+        ops.push(t.value);
+        comps.push(this.parseArith());
+      } else if (t.type === "KEYWORD" && (t.value === "in" || t.value === "is" || t.value === "not")) {
+        this.next();
+        var op = t.value;
+        if (t.value === "not" && this.isKw("in")) { this.next(); op = "not in"; }
+        if (t.value === "is" && this.isKw("not")) { this.next(); op = "is not"; }
+        ops.push(op);
+        comps.push(this.parsePipe());
+      } else break;
+    }
+    if (!ops.length) return left;
+    return { type: "Compare", left: left, ops: ops, comparators: comps, lineno: left.lineno };
+  };
+
+  // | ^ & << >> were missing from the precedence chain (v0.1.5)
+  Parser.prototype.parsePipe = function () {
+    var left = this.parseCaret();
+    while (this.at("OP", "|")) {
+      this.next();
+      left = binOp("BinOp", "|", left, this.parseCaret(), left.lineno);
+    }
+    return left;
+  };
+  Parser.prototype.parseCaret = function () {
+    var left = this.parseAmp();
+    while (this.at("OP", "^")) {
+      this.next();
+      left = binOp("BinOp", "^", left, this.parseAmp(), left.lineno);
+    }
+    return left;
+  };
+  Parser.prototype.parseAmp = function () {
+    var left = this.parseShift();
+    while (this.at("OP", "&")) {
+      this.next();
+      left = binOp("BinOp", "&", left, this.parseShift(), left.lineno);
+    }
+    return left;
+  };
+  Parser.prototype.parseShift = function () {
+    var left = this.parseArith();
+    while (this.at("OP", "<<") || this.at("OP", ">>")) {
+      var op = this.next().value;
+      left = binOp("BinOp", op, left, this.parseArith(), left.lineno);
+    }
+    return left;
+  };
+
+  function binOp(type, op, left, right, ln) { return { type: type, op: op, left: left, right: right, lineno: ln }; }
+
+  Parser.prototype.parseArith = function () {
+    var left = this.parseTerm();
+    while (this.at("OP", "+") || this.at("OP", "-")) {
+      var op = this.next().value;
+      left = binOp("BinOp", op, left, this.parseTerm(), left.lineno);
+    }
+    return left;
+  };
+
+  Parser.prototype.parseTerm = function () {
+    var left = this.parseFactor();
+    while (this.at("OP", "*") || this.at("OP", "/") || this.at("OP", "//") || this.at("OP", "%") || this.at("OP", "@")) {
+      var op = this.next().value;
+      left = binOp("BinOp", op, left, this.parseFactor(), left.lineno);
+    }
+    return left;
+  };
+
+  Parser.prototype.parseFactor = function () {
+    var t = this.peek();
+    if (t.type === "OP" && (t.value === "+" || t.value === "-" || t.value === "~")) {
+      this.next();
+      return { type: "UnaryOp", op: t.value, operand: this.parseFactor(), lineno: t.line };
+    }
+    if (t.type === "KEYWORD" && t.value === "await") {
+      this.next();
+      return { type: "Await", value: this.parseFactor(), lineno: t.line };
+    }
+    return this.parsePower();
+  };
+
+  Parser.prototype.parsePower = function () {
+    var base = this.parsePostfix();
+    if (this.at("OP", "**")) {
+      this.next();
+      return binOp("BinOp", "**", base, this.parseFactor(), base.lineno);
+    }
+    return base;
+  };
+
+  Parser.prototype.parsePostfix = function () {
+    var e = this.parseAtom();
+    while (true) {
+      if (this.at("OP", "(")) {
+        this.next();
+        var args = [];
+        var keywords = [];
+        while (!this.at("OP", ")")) {
+          if (this.at("OP", "*")) {
+            this.next();
+            args.push({ type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line });
+          } else if (this.at("OP", "**")) {
+            this.next();
+            keywords.push({ arg: null, value: this.parseExpr() });
+          } else if (this.at("NAME") && this.peek(1).type === "OP" && this.peek(1).value === "=") {
+            var nm = this.next().value;
+            this.next();
+            keywords.push({ arg: nm, value: this.parseExpr() });
+          } else {
+            var a0 = this.parseExpr();
+            if (this.atCompFor()) {
+              // bare generator expression as the sole call argument (v0.1.5)
+              var gens = this.parseComprehension();
+              args.push({ type: "GeneratorExp", elt: a0, generators: gens, lineno: a0.lineno });
+            } else {
+              args.push(a0);
+            }
+          }
+          if (!this.eat("OP", ",")) break;
+        }
+        this.expect("OP", ")");
+        e = { type: "Call", func: e, args: args, keywords: keywords, lineno: e.lineno };
+      } else if (this.at("OP", "[")) {
+        this.next();
+        var sl = this.parseSlice();
+        this.expect("OP", "]");
+        e = { type: "Subscript", value: e, slice: sl, ctx: "Load", lineno: e.lineno };
+      } else if (this.at("OP", ".")) {
+        this.next();
+        var nt = this.next();
+        // soft keywords (match, case, type, ...) are valid attribute names
+        if (nt.type !== "NAME" && nt.type !== "KEYWORD") throw new Error("expected NAME after dot");
+        var attr = nt.value;
+        e = { type: "Attribute", value: e, attr: attr, ctx: "Load", lineno: e.lineno };
+      } else break;
+    }
+    return e;
+  };
+
+  Parser.prototype.parseSlice = function () {
+    // handle a:b:c, a:, :b, ::, a, multi-dim tuples
+    var parts = [];
+    var dims = [];
+    var sawComma = false;
+    while (true) {
+      parts = [];
+      var first = !this.at("OP", ":");
+      if (first) parts.push(this.parseExpr());
+      if (this.at("OP", ":")) {
+        this.next();
+        var second = null, third = null;
+        if (!this.at("OP", ":") && !this.at("OP", "]") && !this.at("OP", ",")) second = this.parseExpr();
+        if (this.at("OP", ":")) {
+          this.next();
+          if (!this.at("OP", "]") && !this.at("OP", ",")) third = this.parseExpr();
+        }
+        dims.push({ type: "Slice", lower: parts.length ? parts[0] : null, upper: second, step: third });
+      } else {
+        dims.push(parts[0]);
+      }
+      if (!this.eat("OP", ",")) break;
+      sawComma = true;
+      // trailing comma closes the tuple: `tuple[str,]` / `d[a, b,]`
+      // (pre-commit FT13 multi-line annotations). Python keeps it a Tuple
+      // even for one element, so `d[a,]` must not collapse to `d[a]`.
+      if (this.at("OP", "]")) break;
+    }
+    if (dims.length === 1 && !sawComma) return dims[0];
+    return { type: "Tuple", elts: dims, ctx: "Load", lineno: dims[0].lineno };
+  };
+
+  Parser.prototype.parseAtom = function () {
+    var t = this.next();
+    var ln = t.line;
+
+    if (t.type === "KEYWORD" && (t.value === "None" || t.value === "True" || t.value === "False")) {
+      if (t.value === "None") return { type: "Constant", value: null, kind: "none", lineno: ln };
+      if (t.value === "True") return { type: "Constant", value: true, kind: "bool", lineno: ln };
+      return { type: "Constant", value: false, kind: "bool", lineno: ln };
+    }
+
+    if (t.type === "KEYWORD" && (t.value === "match" || t.value === "case")) {
+      // soft keywords used as identifiers: `for case in ...`, `match = re.match(...)`
+      return { type: "Name", id: t.value, ctx: "Load", lineno: ln };
+    }
+
+    if (t.type === "NAME") {
+      return { type: "Name", id: t.value, ctx: "Load", lineno: ln };
+    }
+
+    if (t.type === "NUMBER") {
+      if (t.value.isComplex) return { type: "Constant", value: t.value.value, kind: "complex", raw: t.value.raw, lineno: ln };
+      return { type: "Constant", value: t.value.value, kind: "num", raw: t.value.raw, lineno: ln };
+    }
+
+    if (t.type === "STRING") {
+      // implicit adjacent-string concatenation: "a" f"b" 'c' (v0.1.5)
+      var parts = [t];
+      while (this.peek().type === "STRING") parts.push(this.next());
+      var anyF = false, allBytes = true, anyBad = false;
+      parts.forEach(function (p) {
+        if (p.value.kind === "fstring") anyF = true;
+        if (p.value.kind !== "bytes") allBytes = false;
+        if (p.value.kind === "badstr") anyBad = true;
+      });
+      if (anyF) {
+        var vals = [];
+        parts.forEach(function (p) {
+          if (p.value.kind === "fstring") vals = vals.concat(scanFString(p.value.raw, p.line));
+          else vals.push({ type: "Constant", value: decodeString(p.value.raw, p.value.prefix), kind: "str", lineno: ln });
+        });
+        return { type: "JoinedStr", values: vals, lineno: ln };
+      }
+      if (allBytes) return { type: "Constant", value: null, kind: "bytes", lineno: ln };
+      var combined = "";
+      parts.forEach(function (p) {
+        combined += p.value.kind === "badstr" ? p.value.raw : decodeString(p.value.raw, p.value.prefix);
+      });
+      if (anyBad) return { type: "Constant", value: combined, kind: "badstr", lineno: ln };
+      return { type: "Constant", value: combined, kind: "str", lineno: ln };
+    }
+
+    if (t.type === "OP") {
+      if (t.value === "(") {
+        if (this.at("OP", ")")) { this.next(); return { type: "Tuple", elts: [], ctx: "Load", lineno: ln }; }
+        var first;
+        if (this.at("OP", "*")) { this.next(); first = { type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }; }
+        else first = this.parseExpr();
+        if (this.atCompFor()) {
+          var gens = this.parseComprehension();
+          this.expect("OP", ")");
+          return { type: "GeneratorExp", elt: first, generators: gens, lineno: ln };
+        }
+        if (this.eat("OP", ",")) {
+          var elts = [first];
+          while (!this.at("OP", ")")) {
+            if (this.at("OP", "*")) { this.next(); elts.push({ type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }); }
+            else elts.push(this.parseExpr());
+            if (!this.eat("OP", ",")) break;
+          }
+          this.expect("OP", ")");
+          return { type: "Tuple", elts: elts, ctx: "Load", lineno: ln };
+        }
+        this.expect("OP", ")");
+        return first;
+      }
+      if (t.value === "[") {
+        if (this.at("OP", "]")) { this.next(); return { type: "List", elts: [], ctx: "Load", lineno: ln }; }
+        var e1;
+        if (this.at("OP", "*")) { this.next(); e1 = { type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }; }
+        else e1 = this.parseExpr();
+        if (this.atCompFor()) {
+          var g2 = this.parseComprehension();
+          this.expect("OP", "]");
+          return { type: "ListComp", elt: e1, generators: g2, lineno: ln };
+        }
+        var els = [e1];
+        while (this.eat("OP", ",")) {
+          if (this.at("OP", "]")) break;
+          if (this.at("OP", "*")) { this.next(); els.push({ type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }); }
+          else els.push(this.parseExpr());
+        }
+        this.expect("OP", "]");
+        return { type: "List", elts: els, ctx: "Load", lineno: ln };
+      }
+      if (t.value === "{") {
+        if (this.at("OP", "}")) { this.next(); return { type: "Dict", keys: [], values: [], lineno: ln }; }
+        if (this.at("OP", "**")) {
+          // dict with ** unpack first
+          var dkeys = [], dvals = [];
+          while (true) {
+            if (this.at("OP", "}")) break; // trailing comma guard (v0.1.5)
+            if (this.eat("OP", "**")) {
+              dkeys.push(null);
+              dvals.push(this.parseExpr());
+            } else {
+              var k = this.parseExpr();
+              this.expect("OP", ":");
+              var v = this.parseExpr();
+              dkeys.push(k);
+              dvals.push(v);
+            }
+            if (!this.eat("OP", ",")) break;
+          }
+          this.expect("OP", "}");
+          return { type: "Dict", keys: dkeys, values: dvals, lineno: ln };
+        }
+        var ke;
+        if (this.at("OP", "*")) { this.next(); ke = { type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }; }
+        else ke = this.parseExpr();
+        if (this.eat("OP", ":")) {
+          var ve = this.parseExpr();
+          if (this.atCompFor()) {
+            var g3 = this.parseComprehension();
+            this.expect("OP", "}");
+            return { type: "DictComp", key: ke, value: ve, generators: g3, lineno: ln };
+          }
+          var dk2 = [ke], dv2 = [ve];
+          while (this.eat("OP", ",")) {
+            if (this.at("OP", "}")) break;
+            if (this.eat("OP", "**")) { dk2.push(null); dv2.push(this.parseExpr()); }
+            else {
+              dk2.push(this.parseExpr());
+              this.expect("OP", ":");
+              dv2.push(this.parseExpr());
+            }
+          }
+          this.expect("OP", "}");
+          return { type: "Dict", keys: dk2, values: dv2, lineno: ln };
+        }
+        if (this.atCompFor()) {
+          var g4 = this.parseComprehension();
+          this.expect("OP", "}");
+          return { type: "SetComp", elt: ke, generators: g4, lineno: ln };
+        }
+        var se = [ke];
+        while (this.eat("OP", ",")) {
+          if (this.at("OP", "}")) break;
+          if (this.at("OP", "*")) { this.next(); se.push({ type: "Starred", value: this.parseExpr(), lineno: this.peek(-1).line }); }
+          else se.push(this.parseExpr());
+        }
+        this.expect("OP", "}");
+        return { type: "Set", elts: se, ctx: "Load", lineno: ln };
+      }
+      if (t.value === "...") return { type: "Constant", value: null, kind: "ellipsis", lineno: ln };
+      throw new Error("unexpected op " + t.value);
+    }
+    throw new Error("unexpected token " + t.type);
+  };
+
+  // Comprehension generator-list entry: plain `for` or `async for`
+  // (async comprehensions; black's slices.py fixture skipped whole on the
+  // async form, FT13 sweep). Only `async` IMMEDIATELY followed by `for`
+  // counts, so it can never be misread elsewhere.
+  Parser.prototype.atCompFor = function () {
+    if (this.isKw("for")) return true;
+    if (this.isKw("async")) {
+      var nx = this.peek(1);
+      return !!(nx && nx.type === "KEYWORD" && nx.value === "for");
+    }
+    return false;
+  };
+
+  Parser.prototype.parseComprehension = function () {
+    var gens = [];
+    while (this.atCompFor()) {
+      var isAsync = false;
+      if (this.isKw("async")) { this.next(); isAsync = true; }
+      this.expect("KEYWORD", "for");
+      var target = setStore(this.parseAssignable()); // or_test_nocond in Python grammar
+      this.expect("KEYWORD", "in");
+      var iter = this.parseOrTest();
+      var ifs = [];
+      while (this.isKw("if")) {
+        this.next();
+        ifs.push(this.parseOrTest());
+      }
+      gens.push({ type: "comprehension", target: target, iter: iter, ifs: ifs, isAsync: isAsync });
+    }
+    return gens;
+  };
+
+  /* ------------------------------------------------------------ string decode */
+
+  var ESC_MAP = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', a: "\x07", b: "\b", f: "\f", v: "\v", "0": "\0" };
+
+  function decodeString(raw, prefix) {
+    if (prefix.indexOf("r") !== -1) return raw;
+    var out = "";
+    for (var i = 0; i < raw.length; i++) {
+      var c = raw[i];
+      if (c !== "\\") { out += c; continue; }
+      i++;
+      if (i >= raw.length) { out += "\\"; break; }
+      var e = raw[i];
+      if (ESC_MAP[e] !== undefined) { out += ESC_MAP[e]; continue; }
+      if (e === "x") {
+        var hex = raw.slice(i + 1, i + 3);
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); i += 2; continue; }
+        out += "\\x"; continue;
+      }
+      if (e === "u") {
+        var u = raw.slice(i + 1, i + 5);
+        if (/^[0-9a-fA-F]{4}$/.test(u)) { out += String.fromCharCode(parseInt(u, 16)); i += 4; continue; }
+        out += "\\u"; continue;
+      }
+      if (/[0-7]/.test(e)) {
+        var oct = e;
+        var j = i + 1;
+        while (j < raw.length && /[0-7]/.test(raw[j]) && oct.length < 3) { oct += raw[j]; j++; }
+        out += String.fromCharCode(parseInt(oct, 8));
+        i = j - 1;
+        continue;
+      }
+      out += e;
+    }
+    return out;
+  }
+
+  /* ---- f-string scanning: approximate what Python's ast sees inside {expr} ---- */
+
+  var PY_KEYWORDS = {};
+  KEYWORDS && Object.keys(KEYWORDS).forEach(function (k) { PY_KEYWORDS[k] = 1; });
+
+  function _countNL(s) {
+    var c = 0, i = -1;
+    while ((i = s.indexOf("\n", i + 1)) !== -1) c++;
+    return c;
+  }
+
+  function scanFString(raw, ln) {
+    // raw is the text between quotes (escapes already processed); ln is the
+    // line where THIS string piece starts (implicit-concat pieces each
+    // carry their own token line). Every {expr} reports the PHYSICAL line
+    // of its opening brace (CPython gives FormattedValue nodes their own
+    // lineno — CrossEdge FT10: literals inside a multi-line f-string were
+    // all reported at the string's start line: 0.2/1.5/2.5 on lines
+    // 1690-1692 came back as 1688).
+    var nodes = [];
+    var re = /\{/g, m, depth = 0, start = -1;
+    for (var i = 0; i < raw.length; i++) {
+      if (raw[i] === "{") {
+        if (raw[i + 1] === "{") { i++; continue; } // escaped brace
+        if (depth === 0) start = i + 1;
+        depth++;
+      } else if (raw[i] === "}") {
+        if (raw[i + 1] === "}") { i++; continue; }
+        depth--;
+        if (depth === 0 && start !== -1) {
+          var expr = raw.slice(start, i);
+          var braceLine = ln + _countNL(raw.slice(0, start - 1));
+          scanFStringExpr(expr, braceLine, nodes);
+          start = -1;
+        }
+      }
+    }
+    return nodes;
+  }
+
+  function scanFStringExpr(expr, ln, nodes) {
+    expr = expr.replace(/![a-zA-Z]/g, " "); // strip !conv (approx)
+    // strip :format spec — but NOT colons that belong to the EXPRESSION:
+    // slices (x[3:], brackets), tuples (sep=(',',':'), parens) and string
+    // literals (strftime('%H:%M')) keep their colons. The old bracket-only
+    // check ate strftime('%Y-%m-%d %H:%M:%S') at its first colon, left an
+    // unterminated quote, and %Y/%H leaked in as phantom names (CrossEdge
+    // FT10: format_alert_* reported 'H'/'Y' undefined). {target:%H:%M} is
+    // ONE format spec: a colon at depth 0 still strips it (Sarah's
+    // night_status.py regression: a dangling %H must not survive).
+    for (var fc = 0, fd = 0, inStr = null; fc < expr.length; fc++) {
+      var ch = expr[fc];
+      if (inStr) {
+        if (ch === "\\") { fc++; continue; }
+        if (ch === inStr) inStr = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') { inStr = ch; continue; }
+      if (ch === "(" || ch === "[" || ch === "{") { fd++; continue; }
+      if (ch === ")" || ch === "]" || ch === "}") { fd = Math.max(0, fd - 1); continue; }
+      if (ch === ":" && fd === 0) {
+        expr = expr.slice(0, fc) + " ";
+        break;
+      }
+    }
+    var orig = expr; // every blank below preserves offsets; lines need the real text
+    function lineAt(off) { return ln + _countNL(orig.slice(0, off)); }
+    // config-ish reads: name['key'] / name["key"] / name.get('key')
+    // AND name.get('key', default) — the default form was invisible to R2
+    // (regex demanded ')' right after the key), so 2-arg .get reads inside
+    // f-strings never registered; the corpus parity catch on pelican FT12
+    // (ft11_fstring_multiline_line) exposed it once the py engine's
+    // early-return fix let soft reads emit. Both forms fall back, so both
+    // are soft reads.
+    // Quoted-string defaults ('strdef') used to kill the WHOLE match: the
+    // default group excluded quotes, so f"x={cfg.get('A_KEY', 'strdef')}"
+    // stayed invisible to the JS engine while py flagged it (Aether's FT12
+    // residual, closed in v0.1.25). The group now tolerates quoted
+    // literals; their content is blanked before the name/number re-emit
+    // below so py's single Constant doesn't leak phantom names.
+    // Unicode idents: the main tokenizer accepts them (isIdentStart/
+    // isIdentPart), so the f-string scanner must too — Aether's residual
+    // on v0.1.20: tokenize took Ø but scanFStringExpr stayed ASCII-only.
+    var getRe = /([\p{L}_][\p{L}\p{N}_.]*)\s*\.\s*get\s*\(\s*(['"])([^'"]+)\2\s*(,\s*(?:[^()'"]|'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")*)?\s*\)/gu;
+    var m;
+    while ((m = getRe.exec(expr)) !== null) {
+      var getArgs = [{ type: "Constant", value: m[3], kind: "str", lineno: lineAt(m.index) }];
+      if (m[4] !== undefined && m[4].trim() !== "") {
+        // placeholder default: only the arg COUNT matters to R2's buckets
+        getArgs.push({ type: "Constant", value: 0, kind: "num", lineno: lineAt(m.index) });
+      }
+      // receiver may be a dotted chain (ctx.params.get): build the nested
+      // Attribute shape Python sees. Emitting only the last segment made
+      // 'params' a bare Name — a phantom on click's tests (FT13 sweep).
+      var recvSegs = m[1].split(".");
+      var recv = { type: "Name", id: recvSegs[0], ctx: "Load", lineno: lineAt(m.index) };
+      for (var rs = 1; rs < recvSegs.length; rs++) {
+        recv = { type: "Attribute", value: recv, attr: recvSegs[rs], ctx: "Load", lineno: lineAt(m.index) };
+      }
+      nodes.push({ type: "Call", func: { type: "Attribute", value: recv, attr: "get", ctx: "Load", lineno: lineAt(m.index) }, args: getArgs, keywords: [], lineno: lineAt(m.index) });
+      // blank the match so the generic name scan below doesn't emit the
+      // receiver a second time (py reports one load; an unblanked match
+      // showed up as "lines 1, 1" on ft12_fstring_unicode_get).
+      expr = expr.slice(0, m.index) + " ".repeat(m[0].length) + expr.slice(m.index + m[0].length);
+      getRe.lastIndex = m.index;
+      // The blanking hides the DEFAULT argument from the generic scans
+      // below; py sees it through the real AST (FormattedValue -> Call
+      // args). Re-emit its numbers and names so R3/R4 stay byte-identical
+      // (pelican FT12: ft11_fstring_multiline_line magic counts).
+      if (m[4]) {
+        var gOff = m[0].indexOf(m[4]);
+        // String-literal defaults must not leak their CONTENT into the
+        // re-emit: py sees one Constant, not the words inside it. Blank
+        // literals to same-length spaces so line offsets stay valid;
+        // numbers and names around them still re-emit.
+        var defSrc = m[4].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, function (q) { return " ".repeat(q.length); });
+        var defNumRe = /(?<![\p{L}\p{N}_.])(\d[\d_]*)(?:\.\d[\d_]*)?/gu;
+        var m2;
+        while ((m2 = defNumRe.exec(defSrc)) !== null) {
+          nodes.push({ type: "Constant", value: parseFloat(m2[0].replace(/_/g, "")), kind: "num", raw: m2[0], lineno: lineAt(m.index + gOff + m2.index) });
+        }
+        var defNameRe = /(?<![\p{L}\p{N}_.])[\p{L}_][\p{L}\p{N}_]*/gu;
+        while ((m2 = defNameRe.exec(defSrc)) !== null) {
+          if (!PY_KEYWORDS[m2[0]]) nodes.push({ type: "Name", id: m2[0], ctx: "Load", lineno: lineAt(m.index + gOff + m2.index) });
+        }
+      }
+    }
+    // subscripts and slices: x[3], x[3:5], x[3:], x[:5], x[1:10:2], x[::2],
+    // x[-3], x[-3:], a[1][2], x['key'], x['key'][:3] — indices are
+    // positions/keys, not magic constants (Python's ast nests them under
+    // Subscript/Slice; the browser engine flattens f-string exprs, so emit
+    // the structure explicitly or R3 counts them). The chain loop replaces
+    // the old name+groups mega-regex: a string-keyed group (x['key'][:3])
+    // used to break it, leaking the slice bound into the tally (CrossEdge
+    // FT10: f"{', '.join(best_exit['signal_types'][:3])}" counted 3 as
+    // magic). v0.1.18 antecedents: step groups, negatives, chained
+    // subscripts (Aether's review of the v0.1.16 diff).
+    var chainRe = /([\p{L}_][\p{L}\p{N}_.]*)\s*((?:\[[^\]]*\])+)/gu;
+    var mkNum = function (s) { return { type: "Constant", value: parseInt(s.replace(/_/g, ""), 10), kind: "num", raw: s, lineno: lineAt(m.index) }; };
+    while ((m = chainRe.exec(expr)) !== null) {
+      var baseName = m[1].split(".")[0];
+      var sub = { type: "Name", id: baseName, ctx: "Load", lineno: lineAt(m.index) };
+      var groups = m[2].match(/\[[^\]]*\]/g);
+      var ok = true;
+      groups.forEach(function (g) {
+        if (!ok) return;
+        var inner = g.slice(1, -1).trim();
+        if (inner.length >= 2 && /^(['"]).*\1$/.test(inner)) {
+          sub = { type: "Subscript", value: sub, slice: { type: "Constant", value: inner.slice(1, -1), kind: "str", lineno: lineAt(m.index) }, ctx: "Load", lineno: lineAt(m.index) };
+        } else if (inner.indexOf(":") === -1) {
+          if (/^-?\d[\d_]*$/.test(inner)) {
+            sub = { type: "Subscript", value: sub, slice: mkNum(inner), ctx: "Load", lineno: lineAt(m.index) };
+          } else { ok = false; } // x[foo] — a real name index; leave it for nameRe
+        } else {
+          var parts = inner.split(":");
+          if (parts.length > 3 || !parts.every(function (p) { return p.trim() === "" || /^-?\d[\d_]*$/.test(p.trim()); })) { ok = false; return; }
+          var lo = parts[0].trim() !== "" ? mkNum(parts[0]) : null;
+          var hi = parts[1].trim() !== "" ? mkNum(parts[1]) : null;
+          var step = parts[2] && parts[2].trim() !== "" ? mkNum(parts[2]) : null;
+          sub = { type: "Subscript", value: sub, slice: { type: "Slice", lower: lo, upper: hi, step: step, lineno: lineAt(m.index) }, ctx: "Load", lineno: lineAt(m.index) };
+        }
+      });
+      if (!ok) { chainRe.lastIndex = m.index + 1; continue; }
+      nodes.push(sub);
+      // blank the whole chain (name + groups) so the generic number/name
+      // scans below don't double-count the index; the pushed Subscript
+      // nodes carry the receiver name for R4.
+      expr = expr.slice(0, m.index) + " ".repeat(m[0].length) + expr.slice(m.index + m[0].length);
+      chainRe.lastIndex = m.index;
+    }
+    // strip string literals so names/numbers inside quotes are not picked up
+    expr = expr.replace(/(['"])(?:\\.|(?!\1).)*\1/g, " ");
+    // keyword-argument names are not name usages (the main parser models
+    // them as keyword nodes; CrossEdge FT10: json.dumps(x, separators=(
+    // ',',':')) and json.dumps(acc, indent=2) inside f-strings leaked
+    // 'separators'/'indent' as phantom names). Blank NAME= only when the
+    // name follows ( , or whitespace — call-argument position; {x=} debug
+    // specs and a == b stay intact.
+    expr = expr.replace(/([\(\s,][\p{L}_][\p{L}\p{N}_]*)\s*=(?!=)/gu, function (mm) { return mm[0] + " ".repeat(mm.length - 1); });
+    // numeric literals
+    // the lookbehind must know Unicode idents too: in f"{ø2}" the 2 is part
+    // of the name, not a magic constant (ASCII \w would let it leak).
+    var numRe = /(?<![\p{L}\p{N}_.])(\d[\d_]*)(?:\.\d[\d_]*)?/gu;
+    while ((m = numRe.exec(expr)) !== null) {
+      var clean = m[0].replace(/_/g, "");
+      nodes.push({ type: "Constant", value: parseFloat(clean), kind: "num", raw: m[0], lineno: lineAt(m.index) });
+    }
+    // bare names (skip attribute tails: `kw.arg` loads `kw`, not `arg`)
+    var nameRe = /(?<![\p{L}\p{N}_.])[\p{L}_][\p{L}\p{N}_]*/gu;
+    while ((m = nameRe.exec(expr)) !== null) {
+      if (!PY_KEYWORDS[m[0]]) {
+        nodes.push({ type: "Name", id: m[0], ctx: "Load", lineno: lineAt(m.index) });
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------ walking */
+
+  function iterChildren(node, fn, parent) {
+    fn(node, parent);
+    var kids = [];
+    switch (node.type) {
+      case "Module": kids = node.body; break;
+      case "FunctionDef": case "AsyncFunctionDef":
+        kids = (node.decorators || []).concat((node.args && node.args.defaults) || [], (node.args && node.args.kw_defaults) || [], node.body); break;
+      case "ClassDef": kids = (node.decorators || []).concat(node.bases || [], (node.keywords || []).map(function (k) { return k.value; }), node.body); break;
+      case "If": case "While": kids = [node.test].concat(node.body, node.orelse); break;
+      case "For": kids = [node.target, node.iter].concat(node.body, node.orelse); break;
+      case "With": kids = []; node.items.forEach(function (it) { kids.push(it.context_expr); if (it.optional_vars) kids.push(it.optional_vars); }); kids = kids.concat(node.body); break;
+      case "Try": kids = node.body.concat(node.handlers, node.orelse, node.finalbody); break;
+      case "Match": kids = [node.subject].concat(node.cases); break;
+      case "Case": kids = [node.pattern]; if (node.guard) kids.push(node.guard); kids = kids.concat(node.body); break;
+      case "MatchOr": kids = node.patterns; break;
+      case "MatchAs": kids = node.pattern ? [node.pattern] : []; break;
+      case "MatchSequence": kids = node.patterns; break;
+      case "MatchMapping": kids = node.keys.concat(node.patterns); break;
+      case "MatchClass": kids = [node.cls].concat(node.patterns, node.kwd_patterns); break;
+      case "MatchStar": kids = []; break;
+      case "MatchValue": kids = [node.value]; break;
+      case "ExceptHandler": kids = []; if (node.name) kids.push({ type: "Name", id: node.name, ctx: "Store", lineno: node.lineno }); kids = kids.concat(node.body); break;
+      case "Assign": kids = node.targets.concat([node.value]); break;
+      case "AugAssign": kids = [node.target, node.value]; break;
+      case "AnnAssign": kids = [node.target, node.annotation]; if (node.value) kids.push(node.value); break;
+      case "Expr": case "Return": case "Delete": case "Await": case "Yield":
+        if (node.value) kids = [node.value]; break;
+      case "Raise":
+        kids = []; if (node.value) kids.push(node.value); if (node.cause) kids.push(node.cause); break;
+      case "Assert":
+        kids = []; if (node.value) kids.push(node.value); if (node.msg) kids.push(node.msg); break;
+      case "YieldFrom": kids = [node.value]; break;
+      case "Lambda": kids = [].concat((node.args && node.args.defaults) || [], (node.args && node.args.kw_defaults) || [], [node.body]); break;
+      case "Call": kids = [node.func].concat(node.args, node.keywords.map(function (k) { return k.value; })); break;
+      case "Attribute": kids = [node.value]; break;
+      case "Subscript": kids = [node.value, node.slice]; break;
+      case "BinOp": kids = [node.left, node.right]; break;
+      case "UnaryOp": kids = [node.operand]; break;
+      case "BoolOp": kids = node.values; break;
+      case "Compare": kids = [node.left].concat(node.comparators); break;
+      case "IfExp": kids = [node.test, node.body, node.orelse]; break;
+      case "Tuple": case "List": case "Set": kids = node.elts || []; break;
+      case "Dict": kids = (node.keys || []).concat(node.values || []); break;
+      case "ListComp": case "SetComp": case "GeneratorExp": kids = [node.elt].concat(node.generators); break;
+      case "DictComp": kids = [node.key, node.value].concat(node.generators); break;
+      case "comprehension": kids = [node.target, node.iter].concat(node.ifs || []); break;
+      case "NamedExpr": kids = [node.target, node.value]; break;
+      case "Starred": kids = [node.value]; break;
+      case "Slice": kids = []; if (node.lower) kids.push(node.lower); if (node.upper) kids.push(node.upper); if (node.step) kids.push(node.step); break;
+      case "JoinedStr": kids = node.values || []; break;
+      case "Name": case "Constant": break;
+      default: break;
+    }
+    for (var i = 0; i < kids.length; i++) {
+      var kid = kids[i];
+      if (!kid) continue;
+      if (Array.isArray(kid)) {
+        // defensive: never recurse a raw array as a node (v0.1.11)
+        for (var j = 0; j < kid.length; j++) if (kid[j]) iterChildren(kid[j], fn, node);
+        continue;
+      }
+      iterChildren(kid, fn, node);
+    }
+  }
+
+  function walk(node, fn) { iterChildren(node, fn, null); }
+
+  /* ------------------------------------------------------------ rules */
+
+  function Finding(rule, severity, file, line, message) {
+    return { rule: rule, severity: severity, file: file, line: line, message: message };
+  }
+
+  function _sigFromArgs(args) {
+    // mirror Python: params = args + kwonlyargs (positional-only excluded)
+    var params = {};
+    args.args.concat(args.kwonly).forEach(function (p) { params[p] = 1; });
+    return { params: params, has_var_kw: !!args.kwarg, location: null, bases: [] };
+  }
+
+  function _initSig(cls) {
+    for (var i = 0; i < cls.body.length; i++) {
+      var n = cls.body[i];
+      if ((n.type === "FunctionDef" || n.type === "AsyncFunctionDef") && n.name === "__init__") {
+        return _sigFromArgs(n.args);
+      }
+    }
+    return null;
+  }
+
+  function _recvName(node) {
+    if (!node) return null;
+    if (node.type === "Name") return node.id;
+    if (node.type === "Attribute") return node.attr;
+    return null;
+  }
+
+  function _receiverRoot(node) {
+    var n = node;
+    while (n && n.type === "Attribute") n = n.value;
+    if (n && n.type === "Name") return n.id;
+    return null;
+  }
+
+  function _addTargetNames(node, into) {
+    if (node.type === "Name") into[node.id] = 1;
+    else if (node.type === "Tuple" || node.type === "List") {
+      (node.elts || []).forEach(function (e) { _addTargetNames(e, into); });
+    } else if (node.type === "Starred") {
+      _addTargetNames(node.value, into);
+    }
+  }
+
+  // Names bound by a match pattern, mirroring drift.py's _add_match_names:
+  // `case a | b:` binds only names bound by EVERY alternative (intersection).
+  function _patternCaptures(node, out) {
+    if (!node) return;
+    if (node.type === "MatchAs") {
+      if (node.pattern) _patternCaptures(node.pattern, out);
+      if (node.name) out.push(node.name);
+    } else if (node.type === "MatchStar") {
+      if (node.name) out.push(node.name);
+    } else if (node.type === "MatchSequence") {
+      node.patterns.forEach(function (p) { _patternCaptures(p, out); });
+    } else if (node.type === "MatchMapping") {
+      node.patterns.forEach(function (p) { _patternCaptures(p, out); });
+      if (node.rest) out.push(node.rest);
+    } else if (node.type === "MatchClass") {
+      node.patterns.forEach(function (p) { _patternCaptures(p, out); });
+      node.kwd_patterns.forEach(function (p) { _patternCaptures(p, out); });
+    } else if (node.type === "MatchOr") {
+      var per = node.patterns.map(function (p) { var s = []; _patternCaptures(p, s); return s; });
+      var common = per[0].slice();
+      for (var i = 1; i < per.length; i++) {
+        common = common.filter(function (n) { return per[i].indexOf(n) !== -1; });
+      }
+      common.forEach(function (n) { out.push(n); });
+    }
+  }
+
+  function _isFixtureDecorator(d) {
+    // @fixture / @pytest.fixture(...) — a direct call to a fixture name is the
+    // fixture's returned closure, never the fixture function itself.
+    var f = d.type === "Call" ? d.func : d;
+    if (f.type === "Name") return f.id === "fixture";
+    if (f.type === "Attribute") return f.attr === "fixture";
+    return false;
+  }
+
+  function _checkR1(trees, classSigs, funcSigs, classMethods, ambiguous, fixtureNames, findings) {
+    Object.keys(trees).forEach(function (file) {
+      if (!trees[file]) return;
+      var parentMap = new Map();
+      walk(trees[file], function (node, parent) { if (parent) parentMap.set(node, parent); });
+      function enclosingClass(node) {
+        var p = parentMap.get(node);
+        while (p) {
+          if (p.type === "ClassDef") return p.name;
+          p = parentMap.get(p);
+        }
+        return null;
+      }
+      walk(trees[file], function (node) {
+        if (node.type !== "Call") return;
+        var sig = null;
+        var target = null;
+        if (node.func.type === "Attribute") {
+          // self./cls. calls resolve against the enclosing class's own
+          // methods first — a same-named module-level function is a different
+          // callee (v0.1.3). ClassName.method(...) is resolvable; any other
+          // receiver (unittest.main, obj.x) cannot be resolved statically —
+          // never guess against module-level functions.
+          var recv = node.func.value;
+          if (recv.type === "Name" && (recv.id === "self" || recv.id === "cls")) {
+            var cls = enclosingClass(node);
+            if (cls !== null && classMethods[cls] && !ambiguous[cls]) {
+              sig = classMethods[cls][node.func.attr] || null;
+            }
+          } else if (recv.type === "Name") {
+            var cn = recv.id;
+            if (classMethods[cn] && !ambiguous[cn]) {
+              sig = classMethods[cn][node.func.attr] || null;
+            }
+          }
+          if (!sig) return;
+          target = node.func.attr;
+        } else if (node.func.type === "Name") {
+          target = node.func.id;
+          if (!target || ambiguous[target]) return;
+          sig = classSigs[target] || funcSigs[target];
+          if (!sig) return;
+          // pytest fixtures are injected by name, never called — a direct call
+          // to a fixture name from another file is the fixture's returned
+          // closure (Python skips only the cross-file global fallback; a
+          // same-file function is still a normal callee).
+          if (fixtureNames[target] && sig.location && sig.location[0] !== file) return;
+        } else {
+          return;
+        }
+        node.keywords.forEach(function (kw) {
+          if (kw.arg === null) return;
+          if (!sig.params[kw.arg] && !sig.has_var_kw) {
+            var where = sig.location ? sig.location[0] + ":" + sig.location[1] : "unknown location";
+            findings.push(Finding("unexpected_kwarg", "error", file, node.lineno,
+              target + "() called with unexpected keyword '" + kw.arg + "' " +
+              "(callee at " + where + " does not accept it; partial patch apply?)"));
+          }
+        });
+      });
+    });
+  }
+
+  function _isConfigName(name) {
+    // Mirror Python _is_config_name: exact CONFIG_NAMES match, or UPPER_CASE
+    // constants built from a config word (DEFAULT_SETTINGS, APP_CONFIG, ...).
+    var low = name.toLowerCase();
+    if (CONFIG_NAMES.indexOf(low) !== -1) return true;
+    if (UPPER_NAME_RE.test(name)) {
+      var words = low.split(/[^a-z0-9]+/);
+      for (var i = 0; i < words.length; i++) {
+        if (CONFIG_NAMES.indexOf(words[i]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
+  function _configSource(node) {
+    // Mirror Python _config_source: classify a config-producing call.
+    // "external" = values come from outside the scanned code (file/env),
+    // {inline: true, keys: [...]} = a json.loads literal defines the keys here,
+    // null = not a config loader at all.
+    if (!node || node.type !== "Call") return null;
+    var f = node.func;
+    var loader = null;
+    if (f.type === "Attribute" && f.value.type === "Name") {
+      var m = f.value.id;
+      if (m === "json" && (f.attr === "load" || f.attr === "loads")) loader = "json";
+      else if (m === "yaml" && (f.attr === "load" || f.attr === "safe_load" || f.attr === "full_load")) loader = "yaml";
+      else if (m === "tomllib" && f.attr === "load") loader = "toml";
+    } else if (f.type === "Attribute" && f.value.type === "Attribute") {
+      if (f.value.attr === "environ" && f.attr === "copy") return "external"; // os.environ.copy()
+    } else if (f.type === "Name" && f.id === "dict") {
+      if (node.args.length && node.args[0].type === "Attribute" && node.args[0].attr === "environ") {
+        return "external"; // dict(os.environ)
+      }
+    }
+    if (loader === null) return null;
+    if (node.args.length && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+      var data = null;
+      try { data = JSON.parse(node.args[0].value); } catch (e) { return null; }
+      if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+        var keys = Object.keys(data).filter(function (k) { return typeof k === "string"; });
+        return keys.length ? { inline: true, keys: keys } : null;
+      }
+      return null;
+    }
+    return "external";
+  }
+
+  function _checkR2(trees, files, findings) {
+    // Faithful port of Python _check_r2 (drift v0.1.5): scope-aware config
+    // tracking with separate buckets so env/soft/ext reads never produce the
+    // same severity as hard config reads, and dead-config only fires for keys
+    // nothing consumes.
+    var definedLocs = {};
+    var readLocs = {};
+    var chainReadLocs = {};
+    var softReadLocs = {};
+    var optionalReadLocs = {}; // reads of keys this scope treats as optional (presence-tested / fallback-read)
+    var listReadLocs = {};
+    var extReadLocs = {};
+    var envReadLocs = {};
+    var attrReadLocs = {}; // config.attr reads: proof-of-life only
+    var envDoc = {};
+    var hasEnvDoc = false;
+    // v0.1.23: a dynamic-keyed read (CONFIG_SECTIONS[name], cfg.get(expr))
+    // can hit ANY key of that dict, so none of its keys is provably dead.
+    // dictDefKeys maps file+"\u0001"+def-name -> keys defined in dict
+    // literals under that name; dynReadNames holds which def-names got a
+    // dynamic read (isort FT11: 5 CONFIG_SECTIONS keys flagged dead while
+    // every read at settings.py:317/756/796 used a variable key).
+    var dictDefKeys = {};
+    var dynReadNames = {};
+    // Names bound to a FULLY KNOWN key set in-file (dict literal, inline
+    // json.loads('{...}'), literal-returning function). Only for these is a
+    // missing key a PROVABLE ghost — subscript/update/setdefault writes never
+    // enumerate the dict (pelican FT12).
+    var dictLitNames = {};
+    function markDictLit(file, name) { if (name) dictLitNames[dynKey(file, name)] = 1; }
+
+    function envPayload(d) {
+      // True when a dict literal merges the process environment
+      // ({**os.environ, "LANG": "C.UTF-8"}): a child-process env payload,
+      // data not config (isort FT11: LANG flagged dead). Star-unpack slots
+      // have null keys, mirroring Python's None.
+      if (!d || d.type !== "Dict") return false;
+      var ks = d.keys || [], vs = d.values || [];
+      for (var i = 0; i < ks.length; i++) {
+        if (ks[i] !== null) continue;
+        var v = vs[i];
+        if (!v) continue;
+        if (v.type === "Name" && v.id === "environ") return true;
+        if (v.type === "Attribute" && v.attr === "environ"
+            && v.value && v.value.type === "Name" && v.value.id === "os") return true;
+      }
+      return false;
+    }
+    function dynDefName(t) {
+      // Receiver/target -> the name its dict-literal defs register under:
+      // bare Name (CONFIG_SECTIONS) or the attribute name for
+      // self.options / X.config-style targets (v0.1.23).
+      if (!t) return null;
+      if (t.type === "Name") return t.id;
+      if (t.type === "Attribute") return t.attr;
+      return null;
+    }
+    function dynKey(file, name) { return file + "\u0001" + name; }
+    function regDictDef(file, name, key) {
+      var dk = dynKey(file, name);
+      (dictDefKeys[dk] = dictDefKeys[dk] || {})[key] = 1;
+    }
+    function addDynRead(file, name) { if (name) dynReadNames[dynKey(file, name)] = 1; }
+
+    Object.keys(files || {}).forEach(function (name) {
+      if (name === ".env" || name === ".env.example") {
+        hasEnvDoc = true;
+        String(files[name]).split(/\r?\n/).forEach(function (line) {
+          var m = ENV_KEY_RE.exec(line);
+          if (m) envDoc[m[1]] = 1;
+        });
+      }
+    });
+
+    function norm(k) { return k.replace(/_/g, "-"); }
+    function empty(o) { for (var k in o) return false; return true; }
+    function normSet(o) { var s = {}; for (var k in o) s[norm(k)] = 1; return s; }
+
+    // Per (file, enclosing function) scope state: config aliases, externally
+    // loaded config names, and names demoted to plain dicts by non-config
+    // calls — keyed by scope node so a loop/function reusing a name never
+    // leaks into another scope (streamlink mdstrm.py field-test FP).
+    var perScope = new Map();
+    function scopeState(file, scope) {
+      var byFile = perScope.get(file);
+      if (!byFile) { byFile = new Map(); perScope.set(file, byFile); }
+      var st = byFile.get(scope);
+      if (!st) { st = { aliases: {}, ext: {}, plain: {}, optional: {} }; byFile.set(scope, st); }
+      return st;
+    }
+    function addDef(k, file, ln) { (definedLocs[k] = definedLocs[k] || []).push([file, ln]); }
+    function addRead(k, file, ln, bucket) { (bucket[k] = bucket[k] || []).push([file, ln]); }
+
+    // Functions whose body is a bare `return {dict literal}` (pyjwt field
+    // test: PyJWS/PyJWT build `self.options = self._get_default_options()`
+    // from such a method). Their keys define config — without this, every
+    // read through self.options was flagged read-but-never-defined.
+    var literalReturners = {};
+    Object.keys(trees).forEach(function (file) {
+      var t = trees[file];
+      if (!t) return;
+      var parts = file.split("/");
+      var base = parts[parts.length - 1];
+      if (base.indexOf("test") === 0 || /_test\.py$/.test(base) || base === "conftest.py"
+          || parts.indexOf("tests") !== -1) return;
+      walk(t, function (node) {
+        if (node.type !== "FunctionDef" && node.type !== "AsyncFunctionDef") return;
+        var body = node.body.slice();
+        if (body.length && body[0].type === "Expr" && body[0].value.type === "Constant"
+            && body[0].value.kind === "str") body = body.slice(1); // docstring
+        if (body.length !== 1 || body[0].type !== "Return") return;
+        var ret = body[0].value;
+        if (!ret || ret.type !== "Dict") return;
+        var keys = [];
+        var ok = true;
+        (ret.keys || []).forEach(function (k) {
+          if (k && k.type === "Constant" && k.kind === "str") keys.push(k.value);
+          else ok = false;
+        });
+        (ret.values || []).forEach(function (v) {
+          if (v && (v.type === "Call" || v.type === "Subscript")) ok = false; // derived dict
+        });
+        if (ok && keys.length) {
+          literalReturners[node.name] = (literalReturners[node.name] || []).concat(keys);
+        }
+      });
+    });
+
+    function cfgTarget(tgt) {
+      if (!tgt) return false;
+      if (tgt.type === "Name") return _isConfigName(tgt.id);
+      if (tgt.type === "Attribute") return _isConfigName(tgt.attr);
+      return false;
+    }
+    function addLiteralReturnerDefs(nodeValue, tgts, file, lineno) {
+      if (!nodeValue || nodeValue.type !== "Call") return false;
+      var f = nodeValue.func;
+      var name = f.type === "Name" ? f.id : f.type === "Attribute" ? f.attr : "";
+      var keys = literalReturners[name];
+      if (!keys) return false;
+      var hit = false;
+      tgts.forEach(function (tgt) {
+        if (cfgTarget(tgt)) {
+          hit = true;
+          keys.forEach(function (k) { addDef(k, file, lineno); });
+          var dn = dynDefName(tgt);
+          if (dn) { keys.forEach(function (k) { regDictDef(file, dn, k); }); markDictLit(file, dn); }
+        }
+      });
+      return hit;
+    }
+
+    Object.keys(trees).forEach(function (file) {
+      var t = trees[file];
+      if (!t) return;
+      var parts = file.split("/");
+      var base = parts[parts.length - 1];
+      if (base.indexOf("test") === 0 || /_test\.py$/.test(base) || base === "conftest.py"
+          || parts.indexOf("tests") !== -1) {
+        // R2 skips test files: they deliberately read missing keys and assert
+        // dead config — both look like drift to R2 but aren't.
+        return;
+      }
+
+      var parentMap = new Map();
+      walk(t, function (node, parent) { if (parent) parentMap.set(node, parent); });
+
+      function scopeKey(node) {
+        var p = parentMap.get(node);
+        while (p) {
+          if (p.type === "FunctionDef" || p.type === "AsyncFunctionDef" || p.type === "Lambda") return p;
+          p = parentMap.get(p);
+        }
+        return null;
+      }
+      function shadowed(node, name) {
+        // True when `name` is bound by an enclosing comprehension target
+        // (e.g. `for s in signals`), so `s['type']` there is NOT a config read.
+        var p = parentMap.get(node);
+        while (p) {
+          if (p.type === "comprehension") {
+            var names = {};
+            _addTargetNames(p.target, names);
+            if (names[name]) return true;
+          } else if (p.type === "FunctionDef" || p.type === "AsyncFunctionDef" || p.type === "Lambda") {
+            return false;
+          }
+          p = parentMap.get(p);
+        }
+        return false;
+      }
+      function isCfg(recv, node) {
+        var st = scopeState(file, scopeKey(node));
+        if (st.aliases[recv] && !shadowed(node, recv)) return true;
+        return _isConfigName(recv) && !st.plain[recv] && !shadowed(node, recv);
+      }
+      function extOf(recv, node) {
+        return !!scopeState(file, scopeKey(node)).ext[recv];
+      }
+      function selfIsCfg(node) {
+        var p = parentMap.get(node);
+        while (p) {
+          if (p.type === "ClassDef") {
+            if (_isConfigName(p.name)) return true;
+            for (var i = 0; i < p.body.length; i++) {
+              var sub = p.body[i];
+              if ((sub.type === "Assign" || sub.type === "AnnAssign") && sub.value && sub.value.type === "Dict") {
+                var tgts = sub.type === "Assign" ? sub.targets : [sub.target];
+                for (var j = 0; j < tgts.length; j++) {
+                  if (tgts[j].type === "Name" && _isConfigName(tgts[j].id)) return true;
+                }
+              }
+            }
+            return false;
+          }
+          p = parentMap.get(p);
+        }
+        return false;
+      }
+      function recvCfg(recvNode, node) {
+        // Bare name: config-ish or alias (isCfg). Attribute chain
+        // (X.config, self.state.settings, lexer.options): the chain ROOT must
+        // be config-ish, or self/cls with a config-ish TAIL. `lexer.options`
+        // is a pygments lexer option dict, not the app config (httpie field
+        // test FP). Bare self counts only inside a config class.
+        if (!recvNode) return false;
+        if (recvNode.type === "Name") {
+          if (recvNode.id === "self" || recvNode.id === "cls") return selfIsCfg(recvNode);
+          return isCfg(recvNode.id, node);
+        }
+        if (recvNode.type === "Attribute") {
+          var root = _receiverRoot(recvNode);
+          if (!root) return false;
+          if (root === "self" || root === "cls") return isCfg(_recvName(recvNode), node);
+          return isCfg(root, node);
+        }
+        return false;
+      }
+      function bindingSourceIsConfigy(expr, node) {
+        // Mirror of the Assign/Call configy test for with/for binding
+        // sources: a config-y callee (`Config()`, `make_options()`) or a
+        // config-ish receiver (`for x in self.options`) keeps the bound
+        // name's config-ness; anything else demotes it to a plain local
+        // (v0.1.11).
+        if (!expr) return false;
+        if (expr.type === "Call") {
+          var f = expr.func;
+          var callee = f.type === "Name" ? f.id : f.type === "Attribute" ? f.attr : "";
+          var calleeLow = callee.toLowerCase();
+          return CONFIG_NAMES.indexOf(calleeLow) !== -1
+            || CONFIG_NAMES.some(function (w) { return calleeLow.length >= w.length && calleeLow.slice(-w.length) === w; });
+        }
+        if (expr.type === "Name" || expr.type === "Attribute") return recvCfg(expr, node);
+        return false;
+      }
+
+      walk(t, function (node) {
+        var skey = scopeKey(node);
+        if (node.type === "Assign") {
+          var envP = node.value.type === "Dict" && envPayload(node.value);
+          if (envP) {
+            // {**os.environ, "LANG": ...} builds a child-process env
+            // payload: data, not config (isort FT11). Demote the target so
+            // later env.get(...) reads never register as config reads.
+            node.targets.forEach(function (tgt) {
+              if (tgt.type === "Name" && _isConfigName(tgt.id)) scopeState(file, skey).plain[tgt.id] = 1;
+            });
+          }
+          if (node.value.type === "Dict" && !envP) {
+            // Handler map: {key: callable} — getter/setter dispatch tables.
+            // Keys are wired: defined AND consumed, so never dead.
+            var keys = node.value.keys || [];
+            var vals = node.value.values || [];
+            var callableMap = keys.length > 0 && keys.every(function (k, i) {
+              var v = vals[i];
+              return v && (v.type === "Name" || v.type === "Attribute" || v.type === "Call");
+            });
+            node.targets.forEach(function (tgt) {
+              if (cfgTarget(tgt)) {
+                var dn = dynDefName(tgt);
+                keys.forEach(function (k) {
+                  if (k && k.type === "Constant" && k.kind === "str") {
+                    addDef(k.value, file, node.lineno);
+                    if (dn) { regDictDef(file, dn, k.value); markDictLit(file, dn); }
+                    if (callableMap) addRead(k.value, file, node.lineno, readLocs);
+                  }
+                });
+              }
+            });
+          }
+          node.targets.forEach(function (tgt) {
+            if (tgt.type === "Subscript" && tgt.slice.type === "Constant" && tgt.slice.kind === "str") {
+              if (recvCfg(tgt.value, node)) {
+                addDef(tgt.slice.value, file, node.lineno);
+                var dn2 = dynDefName(tgt.value);
+                if (dn2) regDictDef(file, dn2, tgt.slice.value);
+              }
+            }
+          });
+          var src = !envP ? _configSource(node.value) : null;
+          if (src !== null) {
+            node.targets.forEach(function (tgt) {
+              if (tgt.type === "Name" && _isConfigName(tgt.id)) {
+                if (src === "external") scopeState(file, skey).ext[tgt.id] = 1;
+                else if (src.inline) {
+                  src.keys.forEach(function (k) { addDef(k, file, node.lineno); });
+                  src.keys.forEach(function (k) { regDictDef(file, tgt.id, k); });
+                  markDictLit(file, tgt.id);
+                }
+              }
+            });
+          } else if (node.value.type === "Name" || node.value.type === "Attribute") {
+            // alias: settings = cfg — inherit config-ness (and external-ness)
+            var srcName = _receiverRoot(node.value);
+            if (srcName && recvCfg(node.value, node)) {
+              node.targets.forEach(function (tgt) {
+                if (tgt.type === "Name") {
+                  var st = scopeState(file, skey);
+                  st.aliases[tgt.id] = 1;
+                  delete st.plain[tgt.id];
+                  if (st.ext[srcName]) st.ext[tgt.id] = 1;
+                }
+              });
+            }
+          } else if (node.value.type === "Call") {
+            var litHit = addLiteralReturnerDefs(node.value, node.targets, file, node.lineno);
+            // `options = fetch(...)` — a plain local dict. Only calls whose
+            // callee is itself config-ish (Options, Settings, ...) keep
+            // config-ness.
+            var f = node.value.func;
+            var callee = f.type === "Name" ? f.id : f.type === "Attribute" ? f.attr : "";
+            var calleeLow = callee.toLowerCase();
+            var configy = CONFIG_NAMES.indexOf(calleeLow) !== -1
+              || CONFIG_NAMES.some(function (w) { return calleeLow.length >= w.length && calleeLow.slice(-w.length) === w; });
+            var dictCopyCfg = false;
+            var srcName2 = null;
+            if (callee === "dict" && node.value.args.length
+                && (node.value.args[0].type === "Name" || node.value.args[0].type === "Attribute")) {
+              srcName2 = _receiverRoot(node.value.args[0]);
+              if (srcName2 && recvCfg(node.value.args[0], node)) { configy = true; dictCopyCfg = true; }
+            }
+            if (!configy && !litHit) {
+              node.targets.forEach(function (tgt) {
+                if (tgt.type === "Name" && _isConfigName(tgt.id)) scopeState(file, skey).plain[tgt.id] = 1;
+              });
+            } else if (dictCopyCfg) {
+              node.targets.forEach(function (tgt) {
+                if (tgt.type === "Name") {
+                  var st2 = scopeState(file, skey);
+                  st2.aliases[tgt.id] = 1;
+                  delete st2.plain[tgt.id];
+                  if (st2.ext[srcName2]) st2.ext[tgt.id] = 1;
+                }
+              });
+            }
+          }
+        } else if (node.type === "AnnAssign") {
+          var envP2 = node.value && node.value.type === "Dict" && envPayload(node.value);
+          if (envP2) {
+            if (node.target.type === "Name" && _isConfigName(node.target.id)) {
+              scopeState(file, skey).plain[node.target.id] = 1;
+            }
+          }
+          if (node.value && node.value.type === "Dict" && !envP2) {
+            var keys2 = node.value.keys || [];
+            var vals2 = node.value.values || [];
+            var callableMap2 = keys2.length > 0 && keys2.every(function (k, i) {
+              var v = vals2[i];
+              return v && (v.type === "Name" || v.type === "Attribute" || v.type === "Call");
+            });
+            if (cfgTarget(node.target)) {
+              var dn3 = dynDefName(node.target);
+              keys2.forEach(function (k) {
+                if (k && k.type === "Constant" && k.kind === "str") {
+                  addDef(k.value, file, node.lineno);
+                  if (dn3) { regDictDef(file, dn3, k.value); markDictLit(file, dn3); }
+                  if (callableMap2) addRead(k.value, file, node.lineno, readLocs);
+                }
+              });
+            }
+          }
+          if (node.value !== null && node.value.type === "Call") {
+            addLiteralReturnerDefs(node.value, [node.target], file, node.lineno);
+          }
+          if (node.value !== null && !envP2 && node.target.type === "Name" && _isConfigName(node.target.id)) {
+            var src2 = _configSource(node.value);
+            if (src2 === "external") scopeState(file, skey).ext[node.target.id] = 1;
+            else if (src2 !== null && src2.inline) {
+              src2.keys.forEach(function (k) { addDef(k, file, node.lineno); });
+              src2.keys.forEach(function (k) { regDictDef(file, node.target.id, k); });
+              markDictLit(file, node.target.id);
+            }
+          }
+        } else if (node.type === "Call") {
+          var f2 = node.func;
+          var callee2 = f2.type === "Name" ? f2.id : f2.type === "Attribute" ? f2.attr : "";
+          var calleeLow2 = callee2.toLowerCase();
+          // A config dict handed to a call (positional, keyword, or **-splat)
+          // is consumed by the callee — renderer, builder, merge — so no key
+          // of it is provably dead (pelican_quickstart CONF -> Jinja
+          // templates, FT12). Exception: config-y constructors
+          // (Config(**cfg)) are the DEF side of the contract.
+          var calleeCfg = CONFIG_NAMES.indexOf(calleeLow2) !== -1
+            || CONFIG_NAMES.some(function (w) { return calleeLow2.length >= w.length && calleeLow2.slice(-w.length) === w; });
+          if (!calleeCfg) {
+            var cfgArgs = node.args.slice();
+            (node.keywords || []).forEach(function (kw) {
+              if (kw.arg === null || kw.arg === undefined) cfgArgs.push(kw.value);
+            });
+            cfgArgs.forEach(function (a) {
+              if (a && recvCfg(a, node)) addDynRead(file, dynDefName(a));
+            });
+          }
+          if (node.args.length && node.args[0].type === "Dict") {
+            // dict literal passed to a config-ish constructor or
+            // super().__init__({...}) — config definitions (v0.1.4).
+            var isSuperInit = f2.type === "Attribute" && f2.attr === "__init__"
+              && f2.value.type === "Call" && f2.value.func.type === "Name" && f2.value.func.id === "super";
+            var configy2 = isSuperInit
+              || CONFIG_NAMES.indexOf(calleeLow2) !== -1
+              || CONFIG_NAMES.some(function (w) { return calleeLow2.length >= w.length && calleeLow2.slice(-w.length) === w; });
+            if (configy2 && !envPayload(node.args[0])) {
+              (node.args[0].keys || []).forEach(function (k) {
+                if (k && k.type === "Constant" && k.kind === "str") addDef(k.value, file, node.lineno);
+              });
+            }
+          }
+          if (callee2 === "pluginargument") {
+            var key = null;
+            if (node.args.length && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+              key = node.args[0].value;
+            } else {
+              node.keywords.forEach(function (kw) {
+                if ((kw.arg === "name" || kw.arg === "argument_name")
+                    && kw.value.type === "Constant" && kw.value.kind === "str") {
+                  key = kw.value.value;
+                }
+              });
+            }
+            if (key) addDef(key, file, node.lineno);
+          }
+          // Schema-call definitions (cfgv family, pre-commit FT13): mirror
+          // of Python — Required('key', ...) / Optional('key', ...) declare
+          // a named config key; defined AND consumed by the machinery.
+          if (SCHEMA_KEY_CALLS.indexOf(callee2) !== -1
+              && node.args.length
+              && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+            addDef(node.args[0].value, file, node.lineno);
+            addRead(node.args[0].value, file, node.lineno, readLocs);
+          }
+          if (f2.type === "Attribute" && (f2.attr === "get" || f2.attr === "getenv" || f2.attr === "get_option")) {
+            var recvNode = f2.value;
+            if (f2.attr === "get") {
+              if (recvCfg(recvNode, node) && node.args.length
+                  && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+                var k = node.args[0].value;
+                if (recvNode.type === "Attribute"
+                    || (recvNode.type === "Name" && (recvNode.id === "self" || recvNode.id === "cls"))) {
+                  addRead(k, file, node.lineno, chainReadLocs);
+                } else if (extOf(_receiverRoot(recvNode), node)) addRead(k, file, node.lineno, extReadLocs);
+                else if (node.args.length >= 2) {
+                  // .get(k, default): explicit fallback — the key is optional.
+                  scopeState(file, skey).optional[k] = 1;
+                  addRead(k, file, node.lineno, softReadLocs);
+                } else {
+                  // .get(k) falls back to None. Fully-known in-file receivers
+                  // (dict literal / inline / literal returner) make a missing
+                  // key a provable ghost (error); external receivers (param,
+                  // instance) keep only a fallback warning (pelican FT12).
+                  var dn0 = dynDefName(recvNode);
+                  if (dn0 && dictLitNames[dynKey(file, dn0)]) addRead(k, file, node.lineno, readLocs);
+                  else {
+                    scopeState(file, skey).optional[k] = 1;
+                    addRead(k, file, node.lineno, softReadLocs);
+                  }
+                }
+              } else if (recvCfg(recvNode, node) && node.args.length) {
+                // cfg.get(expr) — dynamic key, any member could be read
+                // (isort FT11:317 CONFIG_SECTIONS.get(config_file_name)).
+                addDynRead(file, dynDefName(recvNode));
+              }
+            } else if (f2.attr === "getenv") {
+              var recvName = _recvName(recvNode);
+              if ((recvName === "os" || recvName === "environ") && node.args.length
+                  && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+                addRead(node.args[0].value, file, node.lineno, envReadLocs);
+              }
+            } else { // get_option — the method name declares an option read
+              // (no is_cfg gate: opts.get_option(...) is a read regardless of
+              // whether the receiver is config-named — streamlink style)
+              var recvName2 = _recvName(recvNode);
+              if (node.args.length
+                  && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+                var k2 = node.args[0].value;
+                if (extOf(recvName2, node)) addRead(k2, file, node.lineno, extReadLocs);
+                else if (node.args.length >= 2) {
+                  scopeState(file, skey).optional[k2] = 1;
+                  addRead(k2, file, node.lineno, softReadLocs);
+                } else {
+                  var dn0b = dynDefName(recvNode);
+                  if (dn0b && dictLitNames[dynKey(file, dn0b)]) addRead(k2, file, node.lineno, readLocs);
+                  else {
+                    scopeState(file, skey).optional[k2] = 1;
+                    addRead(k2, file, node.lineno, softReadLocs);
+                  }
+                }
+              }
+            }
+          } else if (f2.type === "Attribute" && f2.attr === "setdefault" && recvCfg(f2.value, node)) {
+            // setdefault(key, default) DEFINES the key when missing — a
+            // definition, not just a read (pelican MarkdownReader's MARKDOWN
+            // section, FT12).
+            var sdDn = dynDefName(f2.value);
+            if (node.args.length && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+              addDef(node.args[0].value, file, node.lineno);
+              if (sdDn) regDictDef(file, sdDn, node.args[0].value);
+            }
+            if (node.args.length > 1 && node.args[1].type === "Dict" && !envPayload(node.args[1])) {
+              (node.args[1].keys || []).forEach(function (k) {
+                if (k && k.type === "Constant" && k.kind === "str") {
+                  addDef(k.value, file, node.lineno);
+                  if (sdDn) regDictDef(file, sdDn, k.value);
+                }
+              });
+            }
+          } else if (f2.type === "Attribute" && (f2.attr === "set" || f2.attr === "set_option" || f2.attr === "update")) {
+            if (f2.attr === "set_option" || recvCfg(f2.value, node)) {
+              var recvDn = dynDefName(f2.value);
+              if (node.args.length && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+                addDef(node.args[0].value, file, node.lineno);
+                if (recvDn) regDictDef(file, recvDn, node.args[0].value);
+              } else if (node.args.length && node.args[0].type === "Dict" && !envPayload(node.args[0])) {
+                (node.args[0].keys || []).forEach(function (k) {
+                  if (k && k.type === "Constant" && k.kind === "str") {
+                    addDef(k.value, file, node.lineno);
+                    if (recvDn) regDictDef(file, recvDn, k.value);
+                  }
+                });
+              }
+            }
+          } else if (f2.type === "Name" && f2.id === "getenv") {
+            if (node.args.length && node.args[0].type === "Constant" && node.args[0].kind === "str") {
+              addRead(node.args[0].value, file, node.lineno, envReadLocs);
+            }
+          } else if (f2.type === "Name" && f2.id.toLowerCase().indexOf("get") !== -1
+                     && node.args.length && node.args[0].type === "List") {
+            // helper-style lookup: get_val(["a", "b"], default) — proves the
+            // keys are read (kills false dead-config), but never errors on
+            // them since their source may be external.
+            (node.args[0].elts || []).forEach(function (elt) {
+              if (elt.type === "Constant" && elt.kind === "str") addRead(elt.value, file, node.lineno, listReadLocs);
+            });
+          }
+        } else if (node.type === "Attribute") {
+          // Attribute READ on a config receiver: `config.alert_threshold`
+          // reads key 'alert_threshold'. Class-style config (Config(**cfg))
+          // used to look 100% dead to R2 — the walk had no Attribute branch,
+          // so only .get() and subscript reads registered (kanlaon_watch
+          // field case, v0.1.22). Reads land in their own bucket: they kill
+          // dead-key findings but never generate read-but-never-defined
+          // errors, because an unknown attribute raises AttributeError
+          // (loud) rather than silently defaulting, and method/property
+          // names are indistinguishable statically.
+          if (node.ctx !== "Store" && node.ctx !== "Del" && recvCfg(node.value, node)) {
+            addRead(node.attr, file, node.lineno, attrReadLocs);
+          }
+        } else if (node.type === "Subscript") {
+          if (node.slice.type === "Constant" && node.slice.kind === "str") {
+            var recvNode3 = node.value;
+            if (recvNode3.type === "Name" && recvNode3.id === "environ") {
+              addRead(node.slice.value, file, node.lineno, envReadLocs);
+            } else if (recvCfg(recvNode3, node)) {
+              if (recvNode3.type === "Attribute"
+                  || (recvNode3.type === "Name" && (recvNode3.id === "self" || recvNode3.id === "cls"))) {
+                addRead(node.slice.value, file, node.lineno, chainReadLocs);
+              } else {
+                if (scopeState(file, skey).optional[node.slice.value]) {
+                  addRead(node.slice.value, file, node.lineno, optionalReadLocs);
+                } else {
+                  addRead(node.slice.value, file, node.lineno, extOf(_receiverRoot(recvNode3), node) ? extReadLocs : readLocs);
+                }
+              }
+            }
+          } else if (node.slice.type !== "Slice" && recvCfg(node.value, node)) {
+            // Dynamic-keyed subscript on a config object
+            // (CONFIG_SECTIONS[config_file_name]): the key could be any
+            // member, so no key of that dict is provably dead (isort FT11:
+            // settings.py:756/796).
+            addDynRead(file, dynDefName(node.value));
+          }
+        } else if (node.type === "Compare" && node.left.type === "Constant" && node.left.kind === "str") {
+          // `if "KEY" in settings:` — a presence test. The code handles
+          // absence, so KEY is optional/external by contract; later bare
+          // reads of it must not claim a silent default (pelican
+          // deprecated-setting migrations, FT12).
+          (node.ops || []).forEach(function (op, i) {
+            if ((op === "in" || op === "not in") && recvCfg(node.comparators[i], node)) {
+              scopeState(file, skey).optional[node.left.value] = 1;
+            }
+          });
+        } else if (node.type === "With") {
+          // `with ... as x:` / `async with ... as x:` (async-with parses as
+          // With) bind x as a plain local. A config-ISH bound name (options,
+          // config, ...) is not a config receiver afterwards — aiohttp
+          // sessions and file handles were flagged as config reads (v0.1.11).
+          // Only a config-y constructor (`with Config() as config:`) keeps
+          // config-ness, mirroring the Assign/Call rule.
+          (node.items || []).forEach(function (it) {
+            if (!it.optional_vars) return;
+            if (!bindingSourceIsConfigy(it.context_expr, node)) {
+              var names = {};
+              _addTargetNames(it.optional_vars, names);
+              Object.keys(names).forEach(function (n) { scopeState(file, skey).plain[n] = 1; });
+            }
+          });
+        } else if (node.type === "For") {
+          // async-for parses as For; loop targets are ELEMENTS of the
+          // iterable, not the config object itself. A config-ISH loop
+          // variable is a plain local unless the iterable is itself
+          // config-ish (v0.1.11).
+          if (!bindingSourceIsConfigy(node.iter, node)) {
+            var names2 = {};
+            _addTargetNames(node.target, names2);
+            Object.keys(names2).forEach(function (n) { scopeState(file, skey).plain[n] = 1; });
+          }
+        } else if (node.type === "ExceptHandler") {
+          // `except X as e:` — the bound name is an exception object,
+          // never a config receiver (v0.1.11).
+          if (node.name) scopeState(file, skey).plain[node.name] = 1;
+        }
+      });
+    });
+
+    if (empty(definedLocs) && empty(readLocs) && empty(chainReadLocs) && empty(softReadLocs)
+        && empty(optionalReadLocs) && empty(listReadLocs) && empty(extReadLocs)
+        && empty(attrReadLocs) && empty(envReadLocs)) return;
+
+    var definedN = normSet(definedLocs);
+    var readN = normSet(readLocs);
+    var chainN = normSet(chainReadLocs);
+    var softN = normSet(softReadLocs);
+    var optionalN = normSet(optionalReadLocs);
+    var listN = normSet(listReadLocs);
+    var extN = normSet(extReadLocs);
+    var attrN = normSet(attrReadLocs);
+    // v0.1.23: keys of a dict that has any dynamic-keyed read are not
+    // provably dead (the dynamic read could hit any of them). Union the
+    // literal keys registered under those def-names.
+    var dynN = {};
+    Object.keys(dictDefKeys).forEach(function (dk) {
+      if (dynReadNames[dk]) Object.keys(dictDefKeys[dk]).forEach(function (k) { dynN[norm(k)] = 1; });
+    });
+
+    Object.keys(readLocs).sort().forEach(function (k) {
+      if (definedN[norm(k)] || envDoc[k]) return;
+      var loc = readLocs[k][0];
+      findings.push(Finding("config_drift", "error", loc[0], loc[1],
+        "config key '" + k + "' is read but never defined anywhere. It will silently default."));
+    });
+    Object.keys(chainReadLocs).sort().forEach(function (k) {
+      if (definedN[norm(k)] || envDoc[k]) return;
+      var loc = chainReadLocs[k][0];
+      findings.push(Finding("config_drift", "warning", loc[0], loc[1],
+        "config key '" + k + "' is read through a config object whose key contract " +
+        "is external (obj.config.get(...), self.get(...)) and never defined in " +
+        "code — likely a user-set or externally documented key; verify the spelling."));
+    });
+    Object.keys(softReadLocs).sort().forEach(function (k) {
+      if (definedN[norm(k)] || envDoc[k]) return;
+      var loc = softReadLocs[k][0];
+      findings.push(Finding("config_drift", "warning", loc[0], loc[1],
+        "config key '" + k + "' is read only with a fallback default and never defined " +
+        "in code — the default always applies unless the key is set externally."));
+    });
+    Object.keys(optionalReadLocs).sort().forEach(function (k) {
+      if (definedN[norm(k)] || envDoc[k] || softReadLocs[k]) return;
+      // keys already soft-flagged emit under the fallback message only — one
+      // warning per key, the more specific one (FT12 DEFAULT_DATE case).
+      var loc = optionalReadLocs[k][0];
+      findings.push(Finding("config_drift", "warning", loc[0], loc[1],
+        "config key '" + k + "' is read where the code treats it as optional " +
+        "(presence test or fallback read) but never defined in code — it only " +
+        "exists when set externally; verify the spelling."));
+    });
+    Object.keys(definedLocs).sort().forEach(function (k) {
+      if (readN[norm(k)] || chainN[norm(k)] || softN[norm(k)] || optionalN[norm(k)] || listN[norm(k)] || extN[norm(k)] || attrN[norm(k)] || dynN[norm(k)] || envReadLocs[k]) return;
+      var loc = definedLocs[k][0];
+      findings.push(Finding("config_drift", "warning", loc[0], loc[1],
+        "config key '" + k + "' is defined but never read. Dead config."));
+    });
+    if (hasEnvDoc) {
+      Object.keys(envReadLocs).sort().forEach(function (k) {
+        if (envDoc[k]) return;
+        var loc = envReadLocs[k][0];
+        findings.push(Finding("config_drift", "warning", loc[0], loc[1],
+          "env var '" + k + "' is read but not documented in .env/.env.example. " +
+          "Either it is set externally (fine) or the name is a typo — check."));
+      });
+    }
+  }
+
+  function _pyFloatRepr(v) {
+    // Mirror CPython's float repr: shortest round-trip digits (JS's
+    // toExponential gives the same digits), but Python's NOTATION rules —
+    // plain decimal for 1e-4 <= |v| < 1e16, scientific otherwise, with a
+    // signed exponent zero-padded to at least 2 digits. JS's own rules
+    // differ at both ends (exponential below 1e-6, plain past 1e21) and
+    // pad nothing (CrossEdge FT10: 1e-08 vs 1e-8 broke byte-parity).
+    if (Number.isInteger(v) && Math.abs(v) < 1e16) return v + ".0";
+    var neg = v < 0;
+    var a = Math.abs(v);
+    if (a === 0) return neg ? "-0.0" : "0.0";
+    var s = a.toExponential(); // shortest round-trip, e.g. "1.5e-5"
+    var ei = s.indexOf("e");
+    var mant = s.slice(0, ei);
+    var exp = parseInt(s.slice(ei + 1), 10);
+    var digits = mant.replace(".", "");
+    var out;
+    if (exp >= -4 && exp < 16) {
+      if (exp >= 0) {
+        if (digits.length > exp + 1) out = digits.slice(0, exp + 1) + "." + digits.slice(exp + 1);
+        else out = digits + "0".repeat(exp + 1 - digits.length) + ".0";
+      } else {
+        out = "0." + "0".repeat(-exp - 1) + digits;
+      }
+    } else {
+      out = mant + "e" + (exp < 0 ? "-" : "+") + String(Math.abs(exp)).padStart(2, "0");
+    }
+    return (neg ? "-" : "") + out;
+  }
+
+  var DATA_BOUNDARY = { Expr: 1, Assign: 1, AnnAssign: 1, AugAssign: 1,
+    Return: 1, Raise: 1, Assert: 1, Delete: 1, If: 1, While: 1, For: 1,
+    With: 1, Try: 1, FunctionDef: 1, AsyncFunctionDef: 1, ClassDef: 1,
+    Module: 1 };
+
+  function inDataCollection(node, parentMap) {
+    // Literals nested in a collection literal (List/Tuple/Set) up the chain
+    // before a statement boundary are data named by the collection — a
+    // date matrix, a port list, a fixture — not a scattered constant
+    // (Sarah's verify_refactor.py: Jan 21 / Jun 21 / Dec 21 flagged as
+    // "21 appears 3 times": three different dates sharing a digit).
+    var up = parentMap.get(node);
+    while (up) {
+      if (up.type === "List" || up.type === "Tuple" || up.type === "Set") return true;
+      if (DATA_BOUNDARY[up.type]) return false;
+      up = parentMap.get(up);
+    }
+    return false;
+  }
+
+  function _checkR3(trees, findings) {
+    var counts = {};
+    var parentMap = new Map();
+    Object.keys(trees).forEach(function (file) {
+      var t = trees[file];
+      if (!t) return;
+      var parts = file.split("/");
+      var base = parts[parts.length - 1];
+      if (base.indexOf("test") === 0 || /_test\.py$/.test(base) || base === "conftest.py"
+          || parts.indexOf("tests") !== -1) {
+        // R3 skips test files like R2: tests deliberately repeat literals
+        // as data (vectors, fixtures, key sizes) — repetition there is a
+        // corpus, not an unnamed constant (pyjwt field test).
+        return;
+      }
+      walk(t, function (node, parent) { if (parent) parentMap.set(node, parent); });
+      walk(t, function (node, parent) {
+        if (node.type !== "Constant") return;
+        var v = node.value;
+        if (node.kind === "bool" || (node.kind !== "num")) return;
+        if (!parent) return;
+        if (inDataCollection(node, parentMap)) return;
+        if (parent.type === "Subscript" && parent.slice === node) return;
+        if (parent.type === "Slice") return;
+        if (parent.type === "UnaryOp" && parent.op === "-") {
+          // -3 in x[-3] / x[-3:] — the sign is part of the index, not a
+          // magic constant (CPython folds a bare -3 to Constant(-3) but
+          // keeps UnaryOp(USub) inside subscripts/slices). Aether review
+          // 2026-08-25: the digit leaked in BOTH engines' walkers.
+          var gp = parentMap.get(parent);
+          if (gp && (gp.type === "Slice" || (gp.type === "Subscript" && gp.slice === parent))) return;
+        }
+        if (parent.type === "UnaryOp") {
+          // A sign wraps the literal; the STATEMENT parent still names it
+          // (STD_ERROR_HANDLE = -12, pre-commit FT13) — Python mirror.
+          var signUp = parentMap.get(parent);
+          while (signUp && signUp.type === "UnaryOp") signUp = parentMap.get(signUp);
+          if (signUp && (signUp.type === "Assign" || signUp.type === "AnnAssign")) {
+            var signTgts = signUp.type === "Assign" ? signUp.targets : [signUp.target];
+            if (signTgts.some(function (t) { return t.type === "Name" && UPPER_NAME_RE.test(t.id); })) return;
+          }
+        }
+        if (parent.type === "Dict" && (parent.keys || []).indexOf(node) !== -1) return;
+        if (parent.type === "Dict" && (parent.values || []).indexOf(node) !== -1) return;
+        // keyword-argument values are named by the keyword (stacklevel=3)
+        if (parent.type === "Call" && (parent.keywords || []).some(function (k) { return k.value === node; })) return;
+        // signature defaults are named by their parameter (width=36); JS
+        // stores them now (click field test: they were dropped entirely).
+        if ((parent.type === "FunctionDef" || parent.type === "AsyncFunctionDef" || parent.type === "Lambda")
+            && (((parent.args && parent.args.defaults) || []).indexOf(node) !== -1
+                || ((parent.args && parent.args.kw_defaults) || []).indexOf(node) !== -1)) return;
+        // 1 << 32 bit-magnitude idiom — the shift count is the unit
+        if (parent.type === "BinOp" && (parent.op === "<<" || parent.op === ">>") && parent.right === node) return;
+        // 2 ** 12 bit-magnitude idiom — the exponent is the unit (pre-commit
+        // FT13: max(min(..., 2 ** 17), 2 ** 12) flagged 12 x2).
+        if (parent.type === "BinOp" && parent.op === "**" && parent.right === node) return;
+        // '=' * 79 separator widths — the string is the unit, the count
+        // sizes presentation (pre-commit FT13: try_repo.py banners x3).
+        if (parent.type === "BinOp" && parent.op === "*") {
+          var otherSide = parent.left === node ? parent.right : parent.left;
+          if (otherSide && otherSide.type === "Constant" && otherSide.kind === "str") return;
+        }
+        if (parent.type === "Assign" || parent.type === "AnnAssign") {
+          var targets = parent.type === "Assign" ? parent.targets : [parent.target];
+          var upper = false;
+          targets.forEach(function (tgt) {
+            if (tgt.type === "Name" && UPPER_NAME_RE.test(tgt.id)) upper = true;
+          });
+          if (upper) return;
+        }
+        if (parent.type === "Tuple") {
+          var up = parentMap.get(parent);
+          while (up && up.type === "Tuple") up = parentMap.get(up);
+          if (up && (up.type === "Assign" || up.type === "AnnAssign")) {
+            var tgts = up.type === "Assign" ? up.targets : [up.target];
+            var upperT = false;
+            tgts.forEach(function (tgt) {
+              if (tgt.type === "Name" && UPPER_NAME_RE.test(tgt.id)) upperT = true;
+            });
+            if (upperT) return;
+          }
+        }
+        function inCompareContainer(node) {
+          var up = node;
+          for (;;) {
+            var nxt = parentMap.get(up);
+            if (!nxt) return false;
+            if (nxt.type === "Tuple" || nxt.type === "List") { up = nxt; continue; }
+            return nxt.type === "Compare";
+          }
+        }
+        if (inCompareContainer(node)) {
+          // (3, 0, 2) <= (major, minor, patch), [1, 3, 4] < ver_list:
+          // tuples/lists in comparisons are version checks, not magic.
+          if (parent.type !== "Compare") return;
+          // _ver[0] == 3 — comparing a literal against a subscript is
+          // an index/version check, not a named constant's job.
+          var hasSub = false;
+          [parent.left].concat(parent.comparators).forEach(function (x) {
+            if (x && x.type === "Subscript") hasSub = true;
+          });
+          if (hasSub) return;
+          // 400 <= r.status_code < 500 — chained HTTP status ranges.
+          var ordering = parent.ops.every(function (o) {
+            return o === "<" || o === "<=" || o === ">" || o === ">=";
+          });
+          if (parent.ops.length >= 2 && ordering &&
+              typeof v === "number" && Number.isInteger(v) &&
+              v >= 100 && v <= 600 && v % 100 === 0) return;
+          // len(args) > 3 — argument-count bounds are structural; the guard
+          // states its own contract (pre-commit FT13; Python mirror).
+          var hasLenBound = false;
+          [parent.left].concat(parent.comparators).forEach(function (x) {
+            if (x && x.type === "Call" && x.func && x.func.type === "Name" && x.func.id === "len") hasLenBound = true;
+          });
+          if (hasLenBound) return;
+        }
+        var isInt = node.raw ? !/[.eE]/.test(node.raw) : (Number.isInteger(v) && String(v).indexOf("e") === -1);
+        var disp, key;
+        if (isInt) {
+          if (v === 0 || v === 1 || v === 2 || v === -1) return;  // structural
+          // exact family: String(v) for safe ints (parity with Python str),
+          // raw source text beyond 2^53 where JS numbers silently round.
+          var exact = Number.isSafeInteger(v) ? String(v) : node.raw;
+          key = "i:" + exact;
+          disp = exact;
+        } else {
+          if (v === 0.0 || v === 1.0 || v === 2.0 || v === -1.0) return;
+          disp = _pyFloatRepr(v);
+          key = "f:" + disp;
+          // 7.0 joins 7's family (Python mirror: integer-valued float within
+          // exact range merges into the int family).
+          if (Number.isInteger(v) && Math.abs(v) < 9007199254740992) key = "i:" + String(v);
+        }
+        (counts[key] = counts[key] || []).push([file, node.lineno, disp]);
+      });
+    });
+    Object.keys(counts).sort().forEach(function (key) {
+      var locs = counts[key];
+      if (locs.length >= MAGIC_MIN_COUNT) {
+        var displays = {};
+        locs.forEach(function (l) { displays[l[2]] = 1; });
+        var shown = Object.keys(displays).length === 1 ? Object.keys(displays)[0] : Object.keys(displays).sort().join(" / ");
+        var samples = locs.slice(0, 3).map(function (l) { return l[0] + ":" + l[1]; }).join(", ");
+        findings.push(Finding("magic_number", "warning", locs[0][0], locs[0][1],
+          shown + " appears " + locs.length + " times (" + samples + "). Hardcoded value doing a named constant's job."));
+      }
+    });
+  }
+
+  function _bindNames(node, into, starOut) {
+    // Mirror of Python _bind_names: every name bound by `node`, with
+    // ImportFrom star imports reported via starOut ([dots, module]) so
+    // callers can resolve them against the scan tree (v0.1.14 Phase B).
+    if (node.type === "Assign" || node.type === "AnnAssign") {
+      var targets = node.type === "Assign" ? node.targets : [node.target];
+      targets.forEach(function (tgt) { _addTargetNames(tgt, into); });
+    } else if (node.type === "For") {
+      _addTargetNames(node.target, into);
+    } else if (node.type === "With") {
+      // `with ... as x:` and `async with ... as x:` both bind x (v0.1.5).
+      node.items.forEach(function (it) {
+        if (it.optional_vars) _addTargetNames(it.optional_vars, into);
+      });
+    } else if (node.type === "ExceptHandler") {
+      if (node.name) into[node.name] = 1;
+    } else if (node.type === "FunctionDef" || node.type === "AsyncFunctionDef" || node.type === "ClassDef") {
+      into[node.name] = 1;
+      if (node.type === "FunctionDef" || node.type === "AsyncFunctionDef") {
+        var a = node.args;
+        a.posonly.concat(a.args, a.kwonly).forEach(function (x) { into[x] = 1; });
+        if (a.vararg) into[a.vararg] = 1;
+        if (a.kwarg) into[a.kwarg] = 1;
+      }
+    } else if (node.type === "Lambda") {
+      var la = node.args;
+      la.posonly.concat(la.args, la.kwonly).forEach(function (x) { into[x] = 1; });
+      if (la.vararg) into[la.vararg] = 1;
+      if (la.kwarg) into[la.kwarg] = 1;
+    } else if (node.type === "Import") {
+      node.names.forEach(function (al) {
+        into[al.asname || al.name.split(".")[0]] = 1;
+      });
+    } else if (node.type === "ImportFrom") {
+      // The parser emits `from a import *` as star:true with names:[]
+      // (v0.1.14); a literal "*" alias is kept defensively for other shapes.
+      var isStar = node.star === true || (node.names || []).some(function (al) { return al.name === "*"; });
+      if (isStar) {
+        if (starOut) starOut.push([node.dots, node.module]);
+        return;
+      }
+      node.names.forEach(function (al) {
+        into[al.asname || al.name] = 1;
+      });
+    } else if (node.type === "comprehension") {
+      _addTargetNames(node.target, into);
+    } else if (node.type === "NamedExpr") {
+      _addTargetNames(node.target, into);
+    } else if (node.type === "Case") {
+      // names captured by the case's pattern are defined for the whole
+      // file (R4 is flow-insensitive, like the Python reference)
+      (node.captures || []).forEach(function (n) { into[n] = 1; });
+    }
+  }
+
+  function _findModuleFile(level, module, file, trees) {
+    // Mirror of Python _find_module_file against the scan tree. Returns
+    // the trees key for a (relative or absolute) module, or null when the
+    // module is external — callers must then SKIP instead of guessing.
+    function tryCandidates(base) {
+      var cands = [base + ".py", base + "/__init__.py"];
+      for (var i = 0; i < cands.length; i++) {
+        if (trees[cands[i]]) return cands[i];
+      }
+      return null;
+    }
+    var mparts = module ? module.split(".") : [];
+    if (level > 0) {
+      var parts = file.split("/");
+      parts.pop(); // drop the filename; remaining is the dirname
+      var up = level - 1;
+      if (parts.length < up) return null; // climbed above the scanned root
+      var d = parts.slice(0, parts.length - up);
+      return tryCandidates(d.concat(mparts).join("/"));
+    }
+    return tryCandidates(mparts.join("/"));
+  }
+
+  function _literalAll(value) {
+    // Exact names from a static __all__ literal, else null. Only
+    // list/tuple/set literals of str constants count; anything computed
+    // makes the module unresolvable. Returns {} for `__all__ = []`
+    // (valid: exports nothing) — null is reserved for "no __all__".
+    if (!value || (value.type !== "List" && value.type !== "Tuple" && value.type !== "Set")) return null;
+    var out = {};
+    for (var i = 0; i < value.elts.length; i++) {
+      var elt = value.elts[i];
+      if (elt.type !== "Constant" || typeof elt.value !== "string") return null;
+      out[elt.value] = 1;
+    }
+    return out;
+  }
+
+  function _moduleExports(file, t, trees, memo) {
+    // Names a `from <this file> import *` binds at runtime (v0.1.14).
+    // CPython 3.11 probe-verified: static __all__ wins exactly; otherwise
+    // every module-level name not starting with '_' is exported, including
+    // plain `import x` names; a relative from-import also exports the
+    // sibling submodule name. Star imports resolve recursively. Returns
+    // null when anything is unresolvable (dynamic __all__, unknown star
+    // target, import cycle) so callers keep the legacy whole-file skip.
+    if (memo.has(file)) return memo.get(file);
+    memo.set(file, null); // cycle guard: re-entry means a cycle
+    var body = t.body || [];
+    for (var i = 0; i < body.length; i++) {
+      var n = body[i];
+      if (n.type === "Assign" || n.type === "AnnAssign") {
+        var tgts = n.type === "Assign" ? n.targets : [n.target];
+        for (var j = 0; j < tgts.length; j++) {
+          if (tgts[j].type === "Name" && tgts[j].id === "__all__") {
+            var all = _literalAll(n.value);
+            memo.set(file, all);
+            return all;
+          }
+        }
+      }
+    }
+    var exports = {};
+    var starTargets = [];
+    for (var i = 0; i < body.length; i++) {
+      var n2 = body[i];
+      _bindNames(n2, exports, starTargets);
+      if (n2.type === "ImportFrom" && n2.dots > 0 && n2.module) {
+        exports[n2.module.split(".")[0]] = 1;
+      }
+    }
+    for (var i = 0; i < starTargets.length; i++) {
+      var st = starTargets[i];
+      var target = _findModuleFile(st[0], st[1], file, trees);
+      if (target === null || !trees[target]) { memo.set(file, null); return null; }
+      var sub = _moduleExports(target, trees[target], trees, memo);
+      if (sub === null) { memo.set(file, null); return null; }
+      for (var k in sub) exports[k] = 1;
+    }
+    var cleaned = {};
+    for (var k2 in exports) {
+      if (k2.charAt(0) !== "_") cleaned[k2] = 1;
+    }
+    memo.set(file, cleaned);
+    return cleaned;
+  }
+
+  function _checkR4(trees, findings) {
+    var memo = new Map();
+    Object.keys(trees).forEach(function (file) {
+      var t = trees[file];
+      if (!t || file === ".env") return;
+      var defined = {};
+      var loads = {};
+      var skipFile = false;
+      var starTargets = [];
+      walk(t, function (node) {
+        _bindNames(node, defined, starTargets);
+        if (node.type === "Name" && node.ctx === "Load") {
+          (loads[node.id] = loads[node.id] || []).push(node.lineno);
+        }
+      });
+      // Resolve star imports against the scanned tree. If every target
+      // resolves, its exports are exactly what the star binds; if any
+      // target is external or unresolvable, keep the legacy whole-file
+      // skip (partial resolution could false-positive).
+      for (var i = 0; i < starTargets.length; i++) {
+        var st = starTargets[i];
+        var target = _findModuleFile(st[0], st[1], file, trees);
+        if (target === null || !trees[target]) { skipFile = true; break; }
+        var sub = _moduleExports(target, trees[target], trees, memo);
+        if (sub === null) { skipFile = true; break; }
+        for (var k in sub) defined[k] = 1;
+      }
+      if (skipFile) return;
+      Object.keys(loads).forEach(function (name) {
+        if (defined[name] || BUILTIN_SET[name] || COMPAT_NAMES[name]) return;
+        if (name.length > 2 && name.indexOf("__") === 0 && name.lastIndexOf("__") === name.length - 2) return;
+        var lines = loads[name].slice().sort(function (a, b) { return a - b; });
+        findings.push(Finding("phantom_name", "error", file, lines[0],
+          "'" + name + "' is used but never defined in this file " +
+          "(lines " + lines.slice(0, 4).join(", ") + "). A typo like this silently defaults."));
+      });
+    });
+  }
+
+  /* ------------------------------------------------------------ entry */
+
+  function runDrift(files) {
+    // files: { name: content } — name ".env" is the env file, rest parsed as python
+    var findings = [];
+    var notes = [];
+    var trees = {};
+    var classSigs = {};
+    var funcSigs = {};
+    var classMethods = {};
+    var classBases = {};
+    var fixtureNames = {};
+    var ambiguous = {};
+
+    Object.keys(files).forEach(function (name) {
+      if (name === ".env") { trees[name] = null; return; }
+      if (/\.py$/.test(name) === false) return;
+      var content = files[name];
+      var toks;
+      try { toks = tokenize(content); }
+      catch (e) { notes.push("drift: skipping " + name + " (could not tokenize: " + e.message + ")"); return; }
+      var p = new Parser(toks);
+      var tree;
+      try { tree = p.parseModule(); }
+      catch (e) { notes.push("drift: skipping " + name + " (could not parse: " + e.message + ")"); return; }
+      if (p.parsedErrors > 0) {
+        // A file that fails to parse is skipped WHOLE, mirroring drift.py
+        // (ast.parse raises on the first SyntaxError — CrossEdge FT10:
+        // database.py's cursor..execute made the JS engine scan the
+        // recoverable lines and report findings Python could never see,
+        // inflating families like 100 / 100.0 by 4).
+        notes.push("drift: skipping " + name + " (could not parse)");
+        return;
+      }
+      trees[name] = tree;
+    });
+
+    Object.keys(trees).forEach(function (name) {
+      var t = trees[name];
+      if (!t) return;
+      t.body.forEach(function (n) {
+        if (n.type === "ClassDef") {
+          // class methods (all, incl. __init__) keyed for self./cls./ClassName. calls
+          var methods = {};
+          n.body.forEach(function (sub) {
+            if (sub.type === "FunctionDef" || sub.type === "AsyncFunctionDef") {
+              var ms = _sigFromArgs(sub.args);
+              ms.location = [name, sub.lineno];
+              methods[sub.name] = ms;
+            }
+          });
+          if (classMethods[n.name]) ambiguous[n.name] = 1;
+          else classMethods[n.name] = methods;
+          var s = _initSig(n);
+          if (s !== null) {
+            s.location = [name, n.lineno];
+            s.bases = n.bases.filter(function (b) { return b.type === "Name"; }).map(function (b) { return b.id; });
+            classBases[n.name] = s.bases;
+            if (classSigs[n.name]) ambiguous[n.name] = 1;
+            else classSigs[n.name] = s;
+          }
+        } else if (n.type === "FunctionDef" || n.type === "AsyncFunctionDef") {
+          var s2 = _sigFromArgs(n.args);
+          s2.location = [name, n.lineno];
+          if (n.decorators && n.decorators.some(_isFixtureDecorator)) fixtureNames[n.name] = 1;
+          if (funcSigs[n.name]) ambiguous[n.name] = 1;
+          else funcSigs[n.name] = s2;
+        }
+      });
+    });
+
+    Object.keys(classSigs).forEach(function (name) {
+      var s = classSigs[name];
+      s.bases.forEach(function (base) {
+        if (classSigs[base] && base !== name && !ambiguous[base]) {
+          var bs = classSigs[base];
+          Object.keys(bs.params).forEach(function (p) { s.params[p] = 1; });
+          s.has_var_kw = s.has_var_kw || bs.has_var_kw;
+        }
+      });
+    });
+    // Inherit method signatures through class bases so self.<method>(...) calls
+    // on a subclass resolve against methods defined on its parent.
+    Object.keys(classMethods).forEach(function (name) {
+      (classBases[name] || []).forEach(function (base) {
+        if (classMethods[base] && base !== name && !ambiguous[base]) {
+          Object.keys(classMethods[base]).forEach(function (m) {
+            if (!classMethods[name][m]) classMethods[name][m] = classMethods[base][m];
+          });
+        }
+      });
+    });
+
+    _checkR1(trees, classSigs, funcSigs, classMethods, ambiguous, fixtureNames, findings);
+    _checkR2(trees, files, findings);
+    _checkR3(trees, findings);
+    _checkR4(trees, findings);
+
+    findings.sort(function (a, b) {
+      if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+      if (a.line !== b.line) return a.line - b.line;
+      if (a.rule !== b.rule) return a.rule < b.rule ? -1 : 1;
+      // same file/line/rule: message breaks the tie so both engines emit
+      // identical order regardless of internal bucket ordering (field
+      // parity #8: easter.py:76 had two magic buckets, 100 and 16).
+      return a.message < b.message ? -1 : a.message > b.message ? 1 : 0;
+    });
+    return { findings: findings, notes: notes };
+  }
+
+  /* ------------------------------------------------------------ node CLI */
+
+  function main(argv) {
+    var files = {};
+    argv.forEach(function (f) {
+      var fs = require("fs");
+      var name = f.split("/").pop();
+      files[name] = fs.readFileSync(f, "utf8");
+    });
+    var out = runDrift(files);
+    console.log(JSON.stringify(out.findings, null, 2));
+    if (out.notes.length) console.error(out.notes.join("\n"));
+  }
+
+  if (typeof module !== "undefined" && require.main === module) {
+    main(process.argv.slice(2));
+  }
+
+  return { runDrift: runDrift, VERSION: VERSION, tokenize: tokenize, Parser: Parser };
+});

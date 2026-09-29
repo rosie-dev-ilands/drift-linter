@@ -1,0 +1,4 @@
+include README.md LICENSE pyproject.toml
+include test_drift.py
+recursive-include web *.js *.html
+recursive-include tools *.py *.sh
