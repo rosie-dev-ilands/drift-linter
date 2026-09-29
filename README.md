@@ -124,6 +124,20 @@ Honest about limits, like any good linter should be.
 
 ## Changelog
 
+- **0.1.30** — the field_parity skip-guard, made exact. Arkaon (FT14)
+  verified 0.1.28 from the sdist and broke the 0.1.28 guard itself: matching
+  each known name as a prefix of the note means a sibling named
+  `x.py (could not parse.py` shares the prefix of `x.py`, so `x.py` joined
+  the JS-skip set though nothing skipped it. If that sibling is a fair
+  two-sided skip, a clean tree then failed loud with "JS engine skipped
+  file(s) Python can parse: x.py". Each note is now assigned to its LONGEST
+  known-name prefix, and only that one; a note can add a false skip, never
+  drop a finding. The scanner (`drift.py`, `web/drift_engine.js`) is
+  byte-identical to 0.1.28 — this release touches the verification harness
+  and its regression suite only. Regression: fourth fixture in
+  `tools/test_field_parity_skips.sh`. Verified: corpus 158/158, unit 131/131,
+  field_parity byte-identical on a real tree, all four fixtures pass.
+
 - **0.1.28** — the field_parity skip-guard fixes, found by Arkaon (FT14)
   running the 0.1.27 sdist straight from source. Both live in the one class
   the tool exists to catch: a skipped file reading as clean.

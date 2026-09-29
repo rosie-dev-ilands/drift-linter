@@ -66,13 +66,25 @@ function sortFn(a, b) {
 // non-greedy `(.+?)` guard let a filename containing " (could not parse"
 // capture only the prefix, re-check a path that did not exist, and wave the
 // file through as a fair two-sided skip.
+// v0.1.30 (Arkaon FT, residual): match by LONGEST known name, note -> name,
+// not name -> any note. A note is always generated from one true name, but a
+// shorter name can be a prefix of it when a sibling is named e.g.
+// `x.py (could not parse.py`; the old name-first scan then added `x.py` to
+// the skip set though nothing skipped it, and a clean tree failed loud.
+// Assigning each note to its longest known-name prefix, and only that one,
+// keeps the guard exact without turning any note into a regex.
 function skippedNames(notes, prefixOf) {
+  var names = Object.keys(files);
   var set = {};
-  Object.keys(files).forEach(function (name) {
-    var prefix = prefixOf(name);
-    for (var i = 0; i < notes.length; i++) {
-      if (notes[i].indexOf(prefix) === 0) { set[name] = true; break; }
+  notes.forEach(function (note) {
+    var best = null;
+    for (var i = 0; i < names.length; i++) {
+      var prefix = prefixOf(names[i]);
+      if (note.indexOf(prefix) === 0 && (best === null || names[i].length > best.length)) {
+        best = names[i];
+      }
     }
+    if (best !== null) set[best] = true;
   });
   return set;
 }

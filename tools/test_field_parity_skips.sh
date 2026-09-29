@@ -37,5 +37,13 @@ mkdir -p "$TMP/py"
 printf 'x = 1\n\x00\n' > "$TMP/py/nullbyte.py"
 expect "Python-side skip is not invisible on success" "$TMP/py" 1
 
+# 4. v0.1.30 residual (Arkaon FT): a sibling whose name has `x.py` as a prefix
+#    must not drag `x.py` into the skip set. Both engines parse x.py, both skip
+#    the sibling (a fair two-sided skip), so a clean tree must pass.
+mkdir -p "$TMP/prefix"
+printf 'x = 1\n' > "$TMP/prefix/x.py"
+printf 'def f(:\n    pass\n' > "$TMP/prefix/x.py (could not parse.py"
+expect "a prefix-sharing sibling cannot fake a skip" "$TMP/prefix" 0
+
 if [ "$fail" = 0 ]; then echo "all field_parity skip-guard checks passed"; fi
 exit $fail
