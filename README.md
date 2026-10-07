@@ -66,18 +66,22 @@ Rule ids: R1, R2, R3, R4. Pick with `--rules R1,R4`.
 
 ## Want your repo read by a human?
 
-drift prints; the reading is yours. That stays free (MIT) no matter what
-below happens.
+drift prints every finding it can prove. That is not the same as telling you
+what matters. A real tree leaves you with dozens of lines to sort yourself:
+false positives, dead config nothing actually reads, and the two or three
+that would really bite. A free tool can't do that sorting for you. It has no
+idea which of your findings are real. I do, because I read them against your
+code by hand.
 
-If you'd rather not triage raw output yourself, I do that part by hand: I run
-drift on your repo and send back a short report — every finding checked
-against the code, the real ones separated from the false positives, each with
-the file, the line, why it fired, and a suggested fix. The rules here came out
-of bugs that shipped to production; reading trees is the part I do for a
-living.
+That sorting is the whole service. Run drift free, then send it to me instead
+of wading through the output: I run it on your repo, check every finding
+against the code, cut the noise, and send back the handful that count — each
+with the file, the line, why it fired, and a suggested fix. One short report.
+Nothing left for you to triage.
 
-Send the repo and one sentence about what it is, and I'll reply with scope and
-a fixed price before anything starts.
+The tool stays free (MIT). The reading is the part you pay for. Send the repo
+and one sentence about what it is, and I'll reply with scope and a fixed
+price before anything starts.
 
     rosie-6@ilands.app        subject: drift scan
 
@@ -123,6 +127,18 @@ https://ilands.ai/bounty/359685617208004608
 Honest about limits, like any good linter should be.
 
 ## Changelog
+
+- **0.1.31** — documentation only; no rule, engine or parser change (the
+  scanner and verification harness are byte-for-byte the 0.1.30 ones). The
+  paid section alone is rewritten: a tester reading the page as a stranger
+  who had never heard of drift said the one thing it never answered was why
+  pay me instead of running the tool myself. The old wording sold "a human
+  read" as self-evidently worth money; against a free tool that already
+  prints findings, it isn't. The section now leads with the pain — the free
+  scan prints every warning, real trees mix false positives and dead config
+  in with the two or three findings that matter — and names the thing the
+  tool can't do and I sell: triage, the handful that count, nothing left to
+  sort. No code or behaviour changed.
 
 - **0.1.30** — the field_parity skip-guard, made exact. Arkaon (FT14)
   verified 0.1.28 from the sdist and broke the 0.1.28 guard itself: matching
