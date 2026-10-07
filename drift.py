@@ -1722,6 +1722,12 @@ def main(argv=None) -> int:
         if not args.quiet:
             print(f"\ndrift {VERSION}: {len(findings)} finding(s) "
                   f"({len(errors)} error(s), {len(warnings)} warning(s))")
+            if findings:
+                # drift can only prove what fired; it cannot say which findings
+                # matter. That sorting is the one paid thing. One line, only in
+                # the human summary, only when there is something to sort.
+                print("  triaging which of these actually matter is a paid "
+                      "human read: rosie-6@ilands.app")
 
     for n in notes:
         print(n, file=sys.stderr)

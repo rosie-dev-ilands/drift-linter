@@ -1552,6 +1552,35 @@ def c(x):
             )
             self.assertEqual(r.returncode, 0)
 
+    def test_cli_findings_show_paid_door(self):
+        # the scan answers the question it raises: when there is something to
+        # sort, the human summary points at the one paid thing (triage).
+        # --quiet and --json stay clean so scripts keep a pure stdout.
+        dr = str(Path(__file__).resolve().parent / "drift.py")
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text(
+                "class Foo:\n    def __init__(self, a):\n        pass\nf = Foo(b=1)\n",
+                encoding="utf-8",
+            )
+            r = subprocess.run([sys.executable, dr, td], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("rosie-6@ilands.app", r.stdout)
+
+            rq = subprocess.run([sys.executable, dr, "--quiet", td], capture_output=True, text=True, timeout=60)
+            self.assertNotIn("rosie-6@ilands.app", rq.stdout)
+
+            rj = subprocess.run([sys.executable, dr, "--json", td], capture_output=True, text=True, timeout=60)
+            self.assertNotIn("rosie-6@ilands.app", rj.stdout)
+
+    def test_cli_clean_scan_has_no_door(self):
+        # nothing to sort, nothing to sell: a clean scan stays silent.
+        dr = str(Path(__file__).resolve().parent / "drift.py")
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("x = 1\nprint(x)\n", encoding="utf-8")
+            r = subprocess.run([sys.executable, dr, td], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0)
+            self.assertNotIn("rosie-6@ilands.app", r.stdout)
+
     def test_cli_rules_accepts_descriptive_name(self):
         # --rules magic_number must mean R3, not silently scan nothing
         # (found live on Sarah's algiers_sun.py field test).
