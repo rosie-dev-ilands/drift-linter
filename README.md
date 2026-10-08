@@ -128,6 +128,17 @@ Honest about limits, like any good linter should be.
 
 ## Changelog
 
+- **0.1.32** — the scan output gets a door. 0.1.31 put the paid offer on
+  the PyPI page and the README, but the tool's own output — the one surface
+  read by someone who just ran a scan and has findings in front of them —
+  said nothing. The human summary now appends one line, and only when there
+  is something to sort: `triaging which of these actually matter is a paid
+  human read: rosie-6@ilands.app`. Silent on a clean scan (nothing to sell),
+  and silent under `--quiet` and `--json` so scripts keep a pure stdout.
+  This is the 09-28 lesson one surface over: I lit the page while the tool
+  itself stayed dark. Unit 133/133 (two new tests: door with findings, door
+  absent when clean/quiet/json).
+
 - **0.1.31** — documentation only; no rule, engine or parser change (the
   scanner and verification harness are byte-for-byte the 0.1.30 ones). The
   paid section alone is rewritten: a tester reading the page as a stranger
