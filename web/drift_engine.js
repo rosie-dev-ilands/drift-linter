@@ -39,7 +39,7 @@
     "map max memoryview min next object oct open ord pow print property " +
     "quit range repr reversed round set setattr slice sorted staticmethod str sum " +
     "super tuple type vars zip").split(" ");
-  var BUILTIN_SET = {};
+  var BUILTIN_SET = Object.create(null);
   BUILTINS.forEach(function (b) { BUILTIN_SET[b] = 1; });
 
   // py2 builtins that py3 still provides on some platforms (WindowsError is
@@ -49,7 +49,7 @@
 
   /* ------------------------------------------------------------ tokenizer */
 
-  var KEYWORDS = {};
+  var KEYWORDS = Object.create(null);
   ("False None True and as assert async await break class continue def del elif else except " +
     "finally for from global if import in is lambda nonlocal not or pass raise return try while " +
     "with yield").split(" ").forEach(function (k) { KEYWORDS[k] = 1; });
@@ -431,8 +431,14 @@
           this.parseExprList();
           return { type: "Delete", lineno: t.line };
         case "global": case "nonlocal":
+          // `global a` or `global a, b` / `nonlocal a, b` (comma-separated
+          // names). The old single-name loop stopped at the comma and killed
+          // the whole file (yt-dlp nova.py:62 `nonlocal formats, has_drm`).
           this.next();
-          while (this.at("NAME")) this.next();
+          while (this.at("NAME")) {
+            this.next();
+            if (!this.eat("OP", ",")) break;
+          }
           return { type: "Global", lineno: t.line };
         case "yield":
           // value may be a star-list: `yield a, *b`
@@ -750,7 +756,14 @@
     var kw = this.expect("KEYWORD", "from");
     var parts = [];
     var dots = 0;
-    while (this.eat("OP", ".")) dots++;
+    // Leading relative-import dots: `.` `..` `...` `....` ... The tokenizer
+    // emits `...` (ellipsis) as ONE tok, so count it as three (yt-dlp
+    // `from ...utils import x` killed the whole youtube/ package).
+    while (true) {
+      if (this.eat("OP", ".")) { dots++; continue; }
+      if (this.eat("OP", "...")) { dots += 3; continue; }
+      break;
+    }
     while (this.at("NAME")) {
       parts.push(this.next().value);
       if (!this.eat("OP", ".")) break;
@@ -1694,7 +1707,7 @@
 
   /* ---- f-string scanning: approximate what Python's ast sees inside {expr} ---- */
 
-  var PY_KEYWORDS = {};
+  var PY_KEYWORDS = Object.create(null);
   KEYWORDS && Object.keys(KEYWORDS).forEach(function (k) { PY_KEYWORDS[k] = 1; });
 
   function _countNL(s) {
@@ -1965,7 +1978,7 @@
 
   function _sigFromArgs(args) {
     // mirror Python: params = args + kwonlyargs (positional-only excluded)
-    var params = {};
+    var params = Object.create(null);
     args.args.concat(args.kwonly).forEach(function (p) { params[p] = 1; });
     return { params: params, has_var_kw: !!args.kwarg, location: null, bases: [] };
   }
@@ -2154,16 +2167,16 @@
     // tracking with separate buckets so env/soft/ext reads never produce the
     // same severity as hard config reads, and dead-config only fires for keys
     // nothing consumes.
-    var definedLocs = {};
-    var readLocs = {};
-    var chainReadLocs = {};
-    var softReadLocs = {};
-    var optionalReadLocs = {}; // reads of keys this scope treats as optional (presence-tested / fallback-read)
-    var listReadLocs = {};
-    var extReadLocs = {};
-    var envReadLocs = {};
-    var attrReadLocs = {}; // config.attr reads: proof-of-life only
-    var envDoc = {};
+    var definedLocs = Object.create(null);
+    var readLocs = Object.create(null);
+    var chainReadLocs = Object.create(null);
+    var softReadLocs = Object.create(null);
+    var optionalReadLocs = Object.create(null); // reads of keys this scope treats as optional (presence-tested / fallback-read)
+    var listReadLocs = Object.create(null);
+    var extReadLocs = Object.create(null);
+    var envReadLocs = Object.create(null);
+    var attrReadLocs = Object.create(null); // config.attr reads: proof-of-life only
+    var envDoc = Object.create(null);
     var hasEnvDoc = false;
     // v0.1.23: a dynamic-keyed read (CONFIG_SECTIONS[name], cfg.get(expr))
     // can hit ANY key of that dict, so none of its keys is provably dead.
@@ -2171,13 +2184,13 @@
     // literals under that name; dynReadNames holds which def-names got a
     // dynamic read (isort FT11: 5 CONFIG_SECTIONS keys flagged dead while
     // every read at settings.py:317/756/796 used a variable key).
-    var dictDefKeys = {};
-    var dynReadNames = {};
+    var dictDefKeys = Object.create(null);
+    var dynReadNames = Object.create(null);
     // Names bound to a FULLY KNOWN key set in-file (dict literal, inline
     // json.loads('{...}'), literal-returning function). Only for these is a
     // missing key a PROVABLE ghost — subscript/update/setdefault writes never
     // enumerate the dict (pelican FT12).
-    var dictLitNames = {};
+    var dictLitNames = Object.create(null);
     function markDictLit(file, name) { if (name) dictLitNames[dynKey(file, name)] = 1; }
 
     function envPayload(d) {
@@ -2225,7 +2238,7 @@
 
     function norm(k) { return k.replace(/_/g, "-"); }
     function empty(o) { for (var k in o) return false; return true; }
-    function normSet(o) { var s = {}; for (var k in o) s[norm(k)] = 1; return s; }
+    function normSet(o) { var s = Object.create(null); for (var k in o) s[norm(k)] = 1; return s; }
 
     // Per (file, enclosing function) scope state: config aliases, externally
     // loaded config names, and names demoted to plain dicts by non-config
@@ -2246,7 +2259,7 @@
     // test: PyJWS/PyJWT build `self.options = self._get_default_options()`
     // from such a method). Their keys define config — without this, every
     // read through self.options was flagged read-but-never-defined.
-    var literalReturners = {};
+    var literalReturners = Object.create(null);
     Object.keys(trees).forEach(function (file) {
       var t = trees[file];
       if (!t) return;
@@ -2330,7 +2343,7 @@
         var p = parentMap.get(node);
         while (p) {
           if (p.type === "comprehension") {
-            var names = {};
+            var names = Object.create(null);
             _addTargetNames(p.target, names);
             if (names[name]) return true;
           } else if (p.type === "FunctionDef" || p.type === "AsyncFunctionDef" || p.type === "Lambda") {
@@ -2759,7 +2772,7 @@
           (node.items || []).forEach(function (it) {
             if (!it.optional_vars) return;
             if (!bindingSourceIsConfigy(it.context_expr, node)) {
-              var names = {};
+              var names = Object.create(null);
               _addTargetNames(it.optional_vars, names);
               Object.keys(names).forEach(function (n) { scopeState(file, skey).plain[n] = 1; });
             }
@@ -2770,7 +2783,7 @@
           // variable is a plain local unless the iterable is itself
           // config-ish (v0.1.11).
           if (!bindingSourceIsConfigy(node.iter, node)) {
-            var names2 = {};
+            var names2 = Object.create(null);
             _addTargetNames(node.target, names2);
             Object.keys(names2).forEach(function (n) { scopeState(file, skey).plain[n] = 1; });
           }
@@ -2797,7 +2810,7 @@
     // v0.1.23: keys of a dict that has any dynamic-keyed read are not
     // provably dead (the dynamic read could hit any of them). Union the
     // literal keys registered under those def-names.
-    var dynN = {};
+    var dynN = Object.create(null);
     Object.keys(dictDefKeys).forEach(function (dk) {
       if (dynReadNames[dk]) Object.keys(dictDefKeys[dk]).forEach(function (k) { dynN[norm(k)] = 1; });
     });
@@ -2901,7 +2914,7 @@
   }
 
   function _checkR3(trees, findings) {
-    var counts = {};
+    var counts = Object.create(null);
     var parentMap = new Map();
     Object.keys(trees).forEach(function (file) {
       var t = trees[file];
@@ -3040,7 +3053,7 @@
     Object.keys(counts).sort().forEach(function (key) {
       var locs = counts[key];
       if (locs.length >= MAGIC_MIN_COUNT) {
-        var displays = {};
+        var displays = Object.create(null);
         locs.forEach(function (l) { displays[l[2]] = 1; });
         var shown = Object.keys(displays).length === 1 ? Object.keys(displays)[0] : Object.keys(displays).sort().join(" / ");
         var samples = locs.slice(0, 3).map(function (l) { return l[0] + ":" + l[1]; }).join(", ");
@@ -3134,7 +3147,7 @@
     // makes the module unresolvable. Returns {} for `__all__ = []`
     // (valid: exports nothing) — null is reserved for "no __all__".
     if (!value || (value.type !== "List" && value.type !== "Tuple" && value.type !== "Set")) return null;
-    var out = {};
+    var out = Object.create(null);
     for (var i = 0; i < value.elts.length; i++) {
       var elt = value.elts[i];
       if (elt.type !== "Constant" || typeof elt.value !== "string") return null;
@@ -3167,7 +3180,7 @@
         }
       }
     }
-    var exports = {};
+    var exports = Object.create(null);
     var starTargets = [];
     for (var i = 0; i < body.length; i++) {
       var n2 = body[i];
@@ -3184,7 +3197,7 @@
       if (sub === null) { memo.set(file, null); return null; }
       for (var k in sub) exports[k] = 1;
     }
-    var cleaned = {};
+    var cleaned = Object.create(null);
     for (var k2 in exports) {
       if (k2.charAt(0) !== "_") cleaned[k2] = 1;
     }
@@ -3197,8 +3210,8 @@
     Object.keys(trees).forEach(function (file) {
       var t = trees[file];
       if (!t || file === ".env") return;
-      var defined = {};
-      var loads = {};
+      var defined = Object.create(null);
+      var loads = Object.create(null);
       var skipFile = false;
       var starTargets = [];
       walk(t, function (node) {
@@ -3237,13 +3250,13 @@
     // files: { name: content } — name ".env" is the env file, rest parsed as python
     var findings = [];
     var notes = [];
-    var trees = {};
-    var classSigs = {};
-    var funcSigs = {};
-    var classMethods = {};
-    var classBases = {};
-    var fixtureNames = {};
-    var ambiguous = {};
+    var trees = Object.create(null);
+    var classSigs = Object.create(null);
+    var funcSigs = Object.create(null);
+    var classMethods = Object.create(null);
+    var classBases = Object.create(null);
+    var fixtureNames = Object.create(null);
+    var ambiguous = Object.create(null);
 
     Object.keys(files).forEach(function (name) {
       if (name === ".env") { trees[name] = null; return; }
@@ -3274,7 +3287,7 @@
       t.body.forEach(function (n) {
         if (n.type === "ClassDef") {
           // class methods (all, incl. __init__) keyed for self./cls./ClassName. calls
-          var methods = {};
+          var methods = Object.create(null);
           n.body.forEach(function (sub) {
             if (sub.type === "FunctionDef" || sub.type === "AsyncFunctionDef") {
               var ms = _sigFromArgs(sub.args);
@@ -3344,7 +3357,7 @@
   /* ------------------------------------------------------------ node CLI */
 
   function main(argv) {
-    var files = {};
+    var files = Object.create(null);
     argv.forEach(function (f) {
       var fs = require("fs");
       var name = f.split("/").pop();
