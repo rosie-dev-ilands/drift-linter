@@ -1329,4 +1329,21 @@ client(badkw=1)
       + "    pass\n"
       + "config = {'unused_key': 1}\n",
   },
+  quiet0133_prototype_names: {
+    // A bare `{}` registry made KEYWORDS['constructor'] hit Object.prototype,
+    // so `constructor = 1` tokenized as a KEYWORD and killed the file
+    // (yt-dlp jsinterp.py). Names colliding with prototype members must
+    // tokenize as NAME.
+    "a.py": "config = {'dead_key': 1}\nconstructor = 1\ntoString = 2\nvalueOf = 3\nprint(toString, valueOf)\n",
+  },
+  quiet0133_relative_import_dots: {
+    // `...` is one ellipsis token, not three '.', so `from ...pkg import x`
+    // failed and killed the file whole (yt-dlp youtube/*).
+    "a.py": "from ...pkg import thing\nfrom ..a.b import c\nconfig = {'dead_key': 1}\n",
+  },
+  quiet0133_nonlocal_multi: {
+    // `nonlocal a, b` — the single-name loop stopped at the comma and killed
+    // the file (yt-dlp nova.py `nonlocal formats, has_drm`).
+    "a.py": "config = {'dead_key': 1}\ndef outer():\n    a = 1\n    b = 2\n    def inner():\n        nonlocal a, b\n        a = 3\n    inner()\n    return a\n",
+  },
 };
