@@ -157,6 +157,49 @@ class DriftTest(unittest.TestCase):
         })
         self.assertNotIn("unexpected_kwarg", self.rules_seen(findings))
 
+    def test_r1_local_closure_not_resolved_to_module_func(self):
+        # Regression (v0.1.33): a local closure `parse` was resolved to an
+        # unrelated module-level `parse` in another file, so kwargs the
+        # closure accepts were flagged (yt-dlp common.py -> devalue.py).
+        findings = self.scan({
+            "a.py": "def parse(data, transform_source=None):\n    return data\n",
+            "b.py": (
+                "def make():\n"
+                "    def parse(ie, content, **kwargs):\n"
+                "        return content\n"
+                "    def use(ie, content):\n"
+                "        return parse(ie, content, fatal=True, errnote=False)\n"
+                "    return use\n"
+            ),
+        })
+        self.assertNotIn("unexpected_kwarg", self.rules_seen(findings))
+
+    def test_r1_local_closure_shadows_same_file_module_func(self):
+        # The local binding wins even when the module-level def is in the SAME
+        # file — it must not fall back to the same-file module signature.
+        findings = self.scan({
+            "a.py": (
+                "def parse(data):\n"
+                "    return data\n"
+                "def make():\n"
+                "    def parse(ie, content):\n"
+                "        return content\n"
+                "    return parse(1, 2, fatal=True)\n"
+            ),
+        })
+        self.assertNotIn("unexpected_kwarg", self.rules_seen(findings))
+
+    def test_r1_global_declaration_resolves_module_func(self):
+        # `global parse` sends the reference back to module scope; the
+        # local-binding guard must yield to it.
+        findings = self.scan({
+            "a.py": "def parse(data):\n    return data\n",
+            "b.py": "def make():\n    global parse\n    return parse(1, fatal=True)\n",
+        })
+        r1 = [f for f in findings if f.rule == "unexpected_kwarg"]
+        self.assertEqual(len(r1), 1)
+        self.assertIn("fatal", r1[0].message)
+
     # --- R2: config_drift ---
 
     def test_r2_flags_phantom_key(self):

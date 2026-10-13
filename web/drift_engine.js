@@ -434,12 +434,17 @@
           // `global a` or `global a, b` / `nonlocal a, b` (comma-separated
           // names). The old single-name loop stopped at the comma and killed
           // the whole file (yt-dlp nova.py:62 `nonlocal formats, has_drm`).
+          // The names are kept so R1's scope check can tell a `global`
+          // declaration (module scope) from a `nonlocal` (closure scope).
+          var gNonlocal = t.value === "nonlocal";
           this.next();
+          var gnames = [];
           while (this.at("NAME")) {
+            gnames.push(this.peek().value);
             this.next();
             if (!this.eat("OP", ",")) break;
           }
-          return { type: "Global", lineno: t.line };
+          return { type: gNonlocal ? "Nonlocal" : "Global", names: gnames, lineno: t.line };
         case "yield":
           // value may be a star-list: `yield a, *b`
           var yv = this.parseStarList();
@@ -1903,8 +1908,7 @@
 
   /* ------------------------------------------------------------ walking */
 
-  function iterChildren(node, fn, parent) {
-    fn(node, parent);
+  function childNodes(node) {
     var kids = [];
     switch (node.type) {
       case "Module": kids = node.body; break;
@@ -1956,6 +1960,12 @@
       case "Name": case "Constant": break;
       default: break;
     }
+    return kids;
+  }
+
+  function iterChildren(node, fn, parent) {
+    fn(node, parent);
+    var kids = childNodes(node);
     for (var i = 0; i < kids.length; i++) {
       var kid = kids[i];
       if (!kid) continue;
@@ -2052,11 +2062,69 @@
     return false;
   }
 
+  function _scopeBindings(fn) {
+    // Names bound directly in a function's own scope (params, nested
+    // def/class names, assignment/for/with/except targets, imports), plus the
+    // names it declares `global`. Mirrors Python _function_scope_bindings:
+    // nested function/class/lambda/comprehension bodies are separate scopes,
+    // so we prune there and only bind the nested definition's own NAME.
+    var bound = Object.create(null), globals_ = Object.create(null);
+    var a = fn.args || {};
+    (a.posonly || []).concat(a.args || [], a.kwonly || []).forEach(function (p) { bound[p] = 1; });
+    if (a.vararg) bound[a.vararg] = 1;
+    if (a.kwarg) bound[a.kwarg] = 1;
+    function visit(node) {
+      var kids = childNodes(node);
+      for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
+        if (!c) continue;
+        if (Array.isArray(c)) {
+          for (var j = 0; j < c.length; j++) if (c[j]) visit(c[j]);
+          continue;
+        }
+        if (c.type === "FunctionDef" || c.type === "AsyncFunctionDef" || c.type === "ClassDef") {
+          bound[c.name] = 1; continue;
+        }
+        if (c.type === "Lambda" || c.type === "ListComp" || c.type === "SetComp" ||
+            c.type === "DictComp" || c.type === "GeneratorExp") continue;
+        if (c.type === "Global") { (c.names || []).forEach(function (n) { globals_[n] = 1; }); continue; }
+        if (c.type === "Nonlocal") { (c.names || []).forEach(function (n) { bound[n] = 1; }); continue; }
+        if (c.type === "Name" && c.ctx === "Store") bound[c.id] = 1;
+        else if (c.type === "Import") (c.names || []).forEach(function (al) { bound[al.asname || al.name.split(".")[0]] = 1; });
+        else if (c.type === "ImportFrom") (c.names || []).forEach(function (al) { if (al.name !== "*") bound[al.asname || al.name] = 1; });
+        else if (c.type === "ExceptHandler" && c.name) bound[c.name] = 1;
+        visit(c);
+      }
+    }
+    visit(fn);
+    return { bound: bound, globals: globals_ };
+  }
+
+  function _isLocallyBound(name, node, parentMap, cache) {
+    // A name bound in an enclosing function scope is a local/closure variable,
+    // not a module-level def elsewhere in the project — resolving it against
+    // one manufactures false positives (v0.1.33: local closure `parse` matched
+    // to devalue.parse). A `global name` declaration sends the lookup back to
+    // module level.
+    var par = parentMap.get(node);
+    while (par) {
+      if (par.type === "FunctionDef" || par.type === "AsyncFunctionDef") {
+        var sc = cache.get(par);
+        if (!sc) { sc = _scopeBindings(par); cache.set(par, sc); }
+        if (sc.globals[name]) return false;
+        if (sc.bound[name]) return true;
+      }
+      par = parentMap.get(par);
+    }
+    return false;
+  }
+
   function _checkR1(trees, classSigs, funcSigs, classMethods, ambiguous, fixtureNames, findings) {
     Object.keys(trees).forEach(function (file) {
       if (!trees[file]) return;
       var parentMap = new Map();
       walk(trees[file], function (node, parent) { if (parent) parentMap.set(node, parent); });
+      var scopeCache = new Map();
       function enclosingClass(node) {
         var p = parentMap.get(node);
         while (p) {
@@ -2092,6 +2160,10 @@
         } else if (node.func.type === "Name") {
           target = node.func.id;
           if (!target || ambiguous[target]) return;
+          // A name bound in an enclosing function scope is a local/closure
+          // variable, not a module-level def elsewhere — never resolve it
+          // against one (v0.1.33 local-closure false positive).
+          if (_isLocallyBound(target, node, parentMap, scopeCache)) return;
           sig = classSigs[target] || funcSigs[target];
           if (!sig) return;
           // pytest fixtures are injected by name, never called — a direct call

@@ -1346,4 +1346,18 @@ client(badkw=1)
     // the file (yt-dlp nova.py `nonlocal formats, has_drm`).
     "a.py": "config = {'dead_key': 1}\ndef outer():\n    a = 1\n    b = 2\n    def inner():\n        nonlocal a, b\n        a = 3\n    inner()\n    return a\n",
   },
+  quiet0133_local_closure_not_module_func: {
+    // A local closure `parse` must not resolve to an unrelated module-level
+    // `parse` in another file (yt-dlp common.py:1112 -> devalue.py:234). The
+    // enclosing scope binds `parse`, so the call is not that callee.
+    "a.py": "def parse(data, transform_source=None):\n    return data\n",
+    "b.py": "def make():\n    def parse(ie, content, **kwargs):\n        return content\n    def use(ie, content):\n        return parse(ie, content, fatal=True, errnote=False)\n    return use\n",
+  },
+  quiet0133_global_declared_resolves_module: {
+    // `global parse` sends the reference back to module scope, so the
+    // module-level signature still applies — the local-binding guard must
+    // yield to a global declaration.
+    "a.py": "def parse(data):\n    return data\n",
+    "b.py": "def make():\n    global parse\n    return parse(1, fatal=True)\n",
+  },
 };

@@ -464,10 +464,86 @@ def _find_module_file(level: int, module: Optional[str], p: Path,
     return None
 
 
+def _function_scope_bindings(fn) -> Tuple[Set[str], Set[str]]:
+    """Names bound directly in a function's own scope, and its `global` names.
+
+    Assignment targets, parameters, nested def/class names, imports and
+    for/with/except targets all bind in THIS scope. Bodies of nested
+    functions/classes/lambdas and comprehensions are separate scopes, so we
+    prune there; only the nested definition's own NAME is bound here.
+    """
+    bound: Set[str] = set()
+    globals_: Set[str] = set()
+
+    a = fn.args
+    for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs):
+        bound.add(arg.arg)
+    if a.vararg:
+        bound.add(a.vararg.arg)
+    if a.kwarg:
+        bound.add(a.kwarg.arg)
+
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(child.name)
+                continue
+            if isinstance(child, (ast.Lambda, ast.ListComp, ast.SetComp,
+                                  ast.DictComp, ast.GeneratorExp)):
+                continue
+            if isinstance(child, ast.Global):
+                globals_.update(child.names)
+                continue
+            if isinstance(child, ast.Nonlocal):
+                bound.update(child.names)
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                bound.add(child.id)
+            elif isinstance(child, ast.Import):
+                for al in child.names:
+                    bound.add(al.asname or al.name.split(".")[0])
+            elif isinstance(child, ast.ImportFrom):
+                for al in child.names:
+                    if al.name != "*":
+                        bound.add(al.asname or al.name)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                bound.add(child.name)
+            walk(child)
+
+    walk(fn)
+    return bound, globals_
+
+
+def _is_locally_bound(name: str, node, parent_map, cache) -> bool:
+    """True when `name` refers to a binding in an enclosing function scope.
+
+    A name bound by a nested def/param/assignment in an enclosing function is
+    a local or closure variable — it must NOT be resolved against a
+    same-named module-level function elsewhere in the project (v0.1.33: this
+    is how a local closure `parse` in one file was being matched to an
+    unrelated module-level `parse` in another). A `global name` declaration in
+    any enclosing scope sends the lookup back to module level.
+    """
+    par = parent_map.get(node)
+    while par is not None:
+        if isinstance(par, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            key = id(par)
+            if key not in cache:
+                cache[key] = _function_scope_bindings(par)
+            bound, globals_ = cache[key]
+            if name in globals_:
+                return False
+            if name in bound:
+                return True
+        par = parent_map.get(par)
+    return False
+
+
 def _check_r1(trees, class_sigs, func_sigs, class_methods, ambiguous, findings,
               file_funcs, file_classes, file_imports, star_files, fixture_defs, roots) -> None:
     for p, t in trees.items():
         parent_map = {child: parent for child, parent in _walk_with_parent(t)}
+        scope_cache = {}
 
         def enclosing_class(node) -> Optional[str]:
             par = parent_map.get(node)
@@ -508,6 +584,12 @@ def _check_r1(trees, class_sigs, func_sigs, class_methods, ambiguous, findings,
                     continue
                 target = node.func.id
                 if not target or target in ambiguous:
+                    continue
+                # A name bound in an enclosing function scope is a local/closure
+                # variable, not a module-level def elsewhere in the project —
+                # resolving it against one manufactures false positives
+                # (v0.1.33: local closure `parse` matched to devalue.parse).
+                if _is_locally_bound(target, node, parent_map, scope_cache):
                     continue
                 imp = file_imports.get(p, {}).get(target)
                 if imp is not None:
