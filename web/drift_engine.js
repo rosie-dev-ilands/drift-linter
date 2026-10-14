@@ -1721,6 +1721,19 @@
     return c;
   }
 
+  // Blank every string literal inside an f-string replacement field so
+  // names/numbers in quotes are not picked up. A prefix letter (r/f/b/u,
+  // incl. a nested f"..." field) belongs to the literal, not the code, and
+  // a triple-quoted string is ONE literal — the old single/double regex
+  // leaked both. 0.1.33 field parity on yt-dlp: f'{... r"series" ...}'
+  // reported a phantom 'r', nested f"{x}" reported 'f', and the triple-
+  // quoted f'{... """Run "yt-dlp -U" """ ...}' reported yt/dlp/U.
+  // Alternative order matters: triple quotes before bare quotes.
+  var FSTR_STR_RE = /(?<![\p{L}\p{N}_.])(?:[rRbBuUfF]{0,2})('''[\s\S]*?'''|"""[\s\S]*?"""|'(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*")/gu;
+  function stripStrLits(s) {
+    return s.replace(FSTR_STR_RE, function (mm) { return " ".repeat(mm.length); });
+  }
+
   function scanFString(raw, ln) {
     // raw is the text between quotes (escapes already processed); ln is the
     // line where THIS string piece starts (implicit-concat pieces each
@@ -1881,7 +1894,7 @@
       chainRe.lastIndex = m.index;
     }
     // strip string literals so names/numbers inside quotes are not picked up
-    expr = expr.replace(/(['"])(?:\\.|(?!\1).)*\1/g, " ");
+    expr = stripStrLits(expr);
     // keyword-argument names are not name usages (the main parser models
     // them as keyword nodes; CrossEdge FT10: json.dumps(x, separators=(
     // ',',':')) and json.dumps(acc, indent=2) inside f-strings leaked

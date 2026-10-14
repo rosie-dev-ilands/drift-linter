@@ -1360,4 +1360,22 @@ client(badkw=1)
     "a.py": "def parse(data):\n    return data\n",
     "b.py": "def make():\n    global parse\n    return parse(1, fatal=True)\n",
   },
+  quiet0133_fstring_prefixed_string: {
+    // A prefixed string literal inside an f-string replacement field is ONE
+    // token: the `r` belongs to `r"[_-]"`, not to a name `r`. The old
+    // single-quote strip left the prefix behind (yt-dlp youporn.py:274).
+    "a.py": "import re\ndef f(title, sort):\n    return f'{title} videos by {re.sub(r\"[_-]\", \" \", sort)}'\n",
+  },
+  quiet0133_fstring_nested_fstring: {
+    // A nested f-string inside a replacement field: its `f` prefix is part
+    // of the literal, so no phantom name `f` (yt-dlp pokergo.py:22,
+    // youtube/jsc/_director.py:75).
+    "a.py": "def g(c):\n    return f'{c if c == \"x\" else f\"{c} \"}'\n",
+  },
+  quiet0133_fstring_triple_quoted: {
+    // A triple-quoted string inside a replacement field is one literal; its
+    // contents (and the inner quotes) must not leak as names or numbers
+    // (yt-dlp update.py:205 -> phantom yt/dlp/U).
+    "a.py": "def f(n):\n    return f'{n or \"\"\"Run \"yt-dlp -U\" to update\"\"\"}'\n",
+  },
 };
