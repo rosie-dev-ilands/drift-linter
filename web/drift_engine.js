@@ -1895,6 +1895,24 @@
     }
     // strip string literals so names/numbers inside quotes are not picked up
     expr = stripStrLits(expr);
+    // comprehension targets bind their own names inside the field: in
+    // f"{', '.join(x for x in y)}" the `x` in the elt is a Load bound by
+    // the comprehension, not a phantom. Python's ast models each
+    // `for TARGET in ITER` as a comprehension node; emit the targets so the
+    // walker registers them as defined, and blank the target text so the
+    // name scan below does not emit it as a second load (yt-dlp
+    // devscripts/update_requirements.py:227 t.__name__ for t in ...).
+    var compRe = /\bfor\s+((?:[\p{L}_][\p{L}\p{N}_]*|\s|,|\(|\)|\[|\])+?)\s+in\b/gu;
+    while ((m = compRe.exec(expr)) !== null) {
+      var tgtNames = m[1].match(/[\p{L}_][\p{L}\p{N}_]*/gu) || [];
+      tgtNames.forEach(function (nm) {
+        if (!PY_KEYWORDS[nm]) {
+          nodes.push({ type: "comprehension", target: { type: "Name", id: nm, ctx: "Store", lineno: lineAt(m.index) }, iter: { type: "Constant", value: 0, kind: "num", lineno: lineAt(m.index) }, ifs: [] });
+        }
+      });
+      expr = expr.slice(0, m.index) + " ".repeat(m[0].length) + expr.slice(m.index + m[0].length);
+      compRe.lastIndex = m.index;
+    }
     // keyword-argument names are not name usages (the main parser models
     // them as keyword nodes; CrossEdge FT10: json.dumps(x, separators=(
     // ',',':')) and json.dumps(acc, indent=2) inside f-strings leaked

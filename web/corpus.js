@@ -1378,4 +1378,10 @@ client(badkw=1)
     // (yt-dlp update.py:205 -> phantom yt/dlp/U).
     "a.py": "def f(n):\n    return f'{n or \"\"\"Run \"yt-dlp -U\" to update\"\"\"}'\n",
   },
+  quiet0133_fstring_comprehension: {
+    // A comprehension target inside a replacement field binds its own name:
+    // `t` in the elt is a Load bound by `for t in ...`, not a phantom
+    // (yt-dlp devscripts/update_requirements.py:227).
+    "a.py": "def g(types):\n    return f'expected {\"/\".join(t.__name__ for t in types)} value'\n",
+  },
 };
