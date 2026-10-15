@@ -1134,7 +1134,7 @@
       this.next(); this.next();
       return { type: "Constant", value: -nx.value.value, kind: "num", raw: "-" + nx.value.raw, lineno: t.line };
     }
-    if (t.type === "NUMBER") { this.next(); return { type: "Constant", value: t.value.value, kind: "num", raw: t.value.raw, lineno: t.line }; }
+    if (t.type === "NUMBER") { this.next(); return { type: "Constant", value: t.value.value, kind: t.value.isComplex ? "complex" : "num", raw: t.value.raw, lineno: t.line }; }
     if (t.type === "STRING") {
       this.next();
       if (t.value.kind === "fstring") throw new Error("f-string not allowed in pattern");
@@ -1734,6 +1734,26 @@
     return s.replace(FSTR_STR_RE, function (mm) { return " ".repeat(mm.length); });
   }
 
+  // Python numeric-literal grammar, shared by the f-string scanners' number
+  // sweeps. 0.1.33 field parity on yt-dlp: the old decimal-only regex
+  // (`(\d[\d_]*)(?:\.\d[\d_]*)?`) matched `1e8` as `1` (structural) so every
+  // exponent literal inside {expr} silently vanished from the tally
+  // (ustream rnd(1e8), txxx 1E6); and it never matched 0x/0o/0b at all.
+  var NUM_LIT_RE = /(?<![\p{L}\p{N}_.])(?:0[xXbBoO][0-9a-fA-F_]+|(?:\d[\d_]*)(?:\.\d[\d_]*|\.)?(?:[eE][+-]?\d[\d_]*)?|\.\d[\d_]*)[jJ]?/gu;
+  // Parse a matched literal into a Constant node the way the main tokenizer
+  // does: bases via parseInt, complex flagged (Python's ast gives a complex
+  // Constant, which R3 skips since it is neither int nor float).
+  function numConstFromRaw(raw, lineNo) {
+    var isComplex = /[jJ]$/.test(raw);
+    var clean = raw.replace(/_/g, "").replace(/[jJ]$/, "");
+    var val;
+    if (/^0[xX]/.test(clean)) val = parseInt(clean, 16);
+    else if (/^0[bB]/.test(clean)) val = parseInt(clean.slice(2), 2);
+    else if (/^0[oO]/.test(clean)) val = parseInt(clean.slice(2), 8);
+    else val = parseFloat(clean);
+    return { type: "Constant", value: val, kind: isComplex ? "complex" : "num", raw: raw, lineno: lineNo };
+  }
+
   function scanFString(raw, ln) {
     // raw is the text between quotes (escapes already processed); ln is the
     // line where THIS string piece starts (implicit-concat pieces each
@@ -1839,10 +1859,10 @@
         // literals to same-length spaces so line offsets stay valid;
         // numbers and names around them still re-emit.
         var defSrc = m[4].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, function (q) { return " ".repeat(q.length); });
-        var defNumRe = /(?<![\p{L}\p{N}_.])(\d[\d_]*)(?:\.\d[\d_]*)?/gu;
+        var defNumRe = new RegExp(NUM_LIT_RE.source, "gu");
         var m2;
         while ((m2 = defNumRe.exec(defSrc)) !== null) {
-          nodes.push({ type: "Constant", value: parseFloat(m2[0].replace(/_/g, "")), kind: "num", raw: m2[0], lineno: lineAt(m.index + gOff + m2.index) });
+          nodes.push(numConstFromRaw(m2[0], lineAt(m.index + gOff + m2.index)));
         }
         var defNameRe = /(?<![\p{L}\p{N}_.])[\p{L}_][\p{L}\p{N}_]*/gu;
         while ((m2 = defNameRe.exec(defSrc)) !== null) {
@@ -1893,6 +1913,23 @@
       expr = expr.slice(0, m.index) + " ".repeat(m[0].length) + expr.slice(m.index + m[0].length);
       chainRe.lastIndex = m.index;
     }
+    // Pass 2: a call/grouping base — `foo(...)[4:]`. A dotted NAME base is
+    // consumed above; here the char before `[` is `)`. The base's own names
+    // are still scanned from the remaining text, so emit no receiver; only
+    // the numeric index groups are consumed and blanked. Without this the
+    // slice literal leaked into the tally (yt-dlp thisoldhouse.py:129
+    // `..._login_hint(method="cookies")[4:]`, 0.1.33 field parity).
+    var callSubRe = /(\))\s*(\[[^\]]*\])/gu;
+    while ((m = callSubRe.exec(expr)) !== null) {
+      var inner2 = m[2].slice(1, -1).trim();
+      var simpleIdx = inner2.indexOf(":") === -1
+        ? /^-?\d[\d_]*$/.test(inner2)
+        : inner2.split(":").every(function (p) { return p.trim() === "" || /^-?\d[\d_]*$/.test(p.trim()); });
+      if (!simpleIdx) { callSubRe.lastIndex = m.index + 1; continue; }
+      var gStart = m.index + m[0].indexOf("[");
+      expr = expr.slice(0, gStart) + " ".repeat(m[2].length) + expr.slice(gStart + m[2].length);
+      callSubRe.lastIndex = gStart + m[2].length;
+    }
     // strip string literals so names/numbers inside quotes are not picked up
     expr = stripStrLits(expr);
     // comprehension targets bind their own names inside the field: in
@@ -1919,14 +1956,60 @@
     // 'separators'/'indent' as phantom names). Blank NAME= only when the
     // name follows ( , or whitespace — call-argument position; {x=} debug
     // specs and a == b stay intact.
+    //
+    // The keyword VALUE is handled FIRST: an argument literal named by its
+    // keyword is exempt in Python (ast.keyword is a data boundary), so R3
+    // skips it. This must run before the NAME= blanking below, which erases
+    // the keyword name and would hide `k=7` from any later pass (yt-dlp
+    // tiktok.py:1090 `random.choices(..., k=7)`, 0.1.33). A signed value
+    // (k=-7) is a UnaryOp in Python and stays counted, so the sign is not
+    // part of the blanked literal.
+    expr = expr.replace(/([\(\s,][\p{L}_][\p{L}\p{N}_]*\s*=\s*)(0[xXbBoO][0-9a-fA-F_]+|\d[\d_]*(?:\.\d[\d_]*|\.)?(?:[eE][+-]?\d[\d_]*)?)/gu, function (mm, pre, lit) { return pre + " ".repeat(lit.length); });
     expr = expr.replace(/([\(\s,][\p{L}_][\p{L}\p{N}_]*)\s*=(?!=)/gu, function (mm) { return mm[0] + " ".repeat(mm.length - 1); });
     // numeric literals
     // the lookbehind must know Unicode idents too: in f"{ø2}" the 2 is part
     // of the name, not a magic constant (ASCII \w would let it leak).
-    var numRe = /(?<![\p{L}\p{N}_.])(\d[\d_]*)(?:\.\d[\d_]*)?/gu;
+    // Data inside a collection literal: Python exempts any literal with a
+    // Tuple/List/Set ancestor (the collection names its own data), but the
+    // flat f-string scan has no such nodes, so a number in
+    // `bytes((bt & 255, )).hex()` leaked while Python counted 255 once less
+    // (yt-dlp cda.py:164, 0.1.33). Detect literal collection groups and blank
+    // the numeric literals inside them. A `(` is a tuple only with a
+    // top-level comma AND when it is not a call's argument list; a `[` is a
+    // list only when it does not follow a name/`)`/`]` (otherwise it is a
+    // subscript, already consumed above). Keyword values were blanked just
+    // above, so `(a, k=3)` stays counted exactly as Python counts it.
+    (function () {
+      var stack = [], marks = [];
+      for (var ci = 0; ci < expr.length; ci++) {
+        var ch2 = expr[ci];
+        if (ch2 === "(" || ch2 === "[") {
+          var prev = ci > 0 ? expr[ci - 1] : "";
+          var afterCall = /[\p{L}\p{N}_.\)\]]/u.test(prev);
+          stack.push({ ch: ch2, start: ci, comma: false, literal: !afterCall });
+        } else if (ch2 === ")" || ch2 === "]") {
+          if (stack.length) {
+            var grp = stack.pop();
+            if (grp.literal && (grp.ch === "[" || grp.comma)) marks.push([grp.start + 1, ci]);
+          }
+        } else if (ch2 === "," && stack.length) {
+          stack[stack.length - 1].comma = true;
+        }
+      }
+      if (!marks.length) return;
+      var spans = [];
+      var nre = new RegExp(NUM_LIT_RE.source, "gu"), nm;
+      while ((nm = nre.exec(expr)) !== null) spans.push([nm.index, nm.index + nm[0].length]);
+      var chars = expr.split("");
+      spans.forEach(function (sp) {
+        var inside = marks.some(function (mk) { return sp[0] >= mk[0] && sp[1] <= mk[1]; });
+        if (inside) for (var k = sp[0]; k < sp[1]; k++) chars[k] = " ";
+      });
+      expr = chars.join("");
+    })();
+    var numRe = new RegExp(NUM_LIT_RE.source, "gu");
     while ((m = numRe.exec(expr)) !== null) {
-      var clean = m[0].replace(/_/g, "");
-      nodes.push({ type: "Constant", value: parseFloat(clean), kind: "num", raw: m[0], lineno: lineAt(m.index) });
+      nodes.push(numConstFromRaw(m[0], lineAt(m.index)));
     }
     // bare names (skip attribute tails: `kw.arg` loads `kw`, not `arg`)
     var nameRe = /(?<![\p{L}\p{N}_.])[\p{L}_][\p{L}\p{N}_]*/gu;
@@ -2998,8 +3081,8 @@
 
   var DATA_BOUNDARY = { Expr: 1, Assign: 1, AnnAssign: 1, AugAssign: 1,
     Return: 1, Raise: 1, Assert: 1, Delete: 1, If: 1, While: 1, For: 1,
-    With: 1, Try: 1, FunctionDef: 1, AsyncFunctionDef: 1, ClassDef: 1,
-    Module: 1 };
+    AsyncFor: 1, With: 1, AsyncWith: 1, Try: 1, FunctionDef: 1,
+    AsyncFunctionDef: 1, ClassDef: 1, Module: 1 };
 
   function inDataCollection(node, parentMap) {
     // Literals nested in a collection literal (List/Tuple/Set) up the chain
@@ -3007,10 +3090,19 @@
     // date matrix, a port list, a fixture — not a scattered constant
     // (Sarah's verify_refactor.py: Jan 21 / Jun 21 / Dec 21 flagged as
     // "21 appears 3 times": three different dates sharing a digit).
-    var up = parentMap.get(node);
+    var up = parentMap.get(node), child = node;
     while (up) {
       if (up.type === "List" || up.type === "Tuple" || up.type === "Set") return true;
       if (DATA_BOUNDARY[up.type]) return false;
+      // Python's ast.keyword is itself a data boundary, so a literal that is
+      // (or sits inside) a keyword VALUE never sees an enclosing collection.
+      // JS stores keywords as plain {arg,value} pairs, not nodes, so detect
+      // the boundary by whether `child` is a keyword value of `up`. Without
+      // this, `json.dumps(..., indent=4 if x else None), str_fmt` walked past
+      // the keyword into the tuple and read 4 as data while Python counted it
+      // (yt-dlp YoutubeDL.py:1474, 0.1.33 field parity).
+      if (up.type === "Call" && (up.keywords || []).some(function (k) { return k.value === child; })) return false;
+      child = up;
       up = parentMap.get(up);
     }
     return false;
@@ -3133,7 +3225,12 @@
           });
           if (hasLenBound) return;
         }
-        var isInt = node.raw ? !/[.eE]/.test(node.raw) : (Number.isInteger(v) && String(v).indexOf("e") === -1);
+        // A 0x/0o/0b literal is always an int even though its digits may
+        // contain 'e' (0xe) — the old raw test read 0x9e3779b9 as a float
+        // and displayed 2654435769.0 (yt-dlp xhamster, 0.1.33 field parity).
+        var isInt = node.raw
+          ? (/^0[xXbBoO]/.test(node.raw) || !/[.eE]/.test(node.raw))
+          : (Number.isInteger(v) && String(v).indexOf("e") === -1);
         var disp, key;
         if (isInt) {
           if (v === 0 || v === 1 || v === 2 || v === -1) return;  // structural

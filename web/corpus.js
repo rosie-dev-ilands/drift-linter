@@ -1384,4 +1384,41 @@ client(badkw=1)
     // (yt-dlp devscripts/update_requirements.py:227).
     "a.py": "def g(types):\n    return f'expected {\"/\".join(t.__name__ for t in types)} value'\n",
   },
+  quiet0133_hex_int_not_float: {
+    // A 0x literal is an int even though its digits contain 'e' (0x9e3779b9);
+    // the old raw test read it as a float and displayed "2654435769.0"
+    // (yt-dlp xhamster.py:50).
+    "a.py": "x = 0x9e3779b9\ny = 0x9e3779b9\nz = 0x9e3779b9\n",
+  },
+  quiet0133_fstring_exponent_number: {
+    // An exponent literal inside a replacement field must be parsed whole:
+    // the decimal-only sweep read `1e8` as `1` (structural) and dropped it
+    // from the tally (yt-dlp ustream.py:82, txxx.py:362).
+    "a.py": "def rnd(v):\n    return v\nx = f'a{rnd(1e8)}b'\ny = f'a{rnd(1e8)}b'\nz = f'a{rnd(1e8)}b'\n",
+  },
+  quiet0133_fstring_call_then_slice: {
+    // A slice on a call result inside a replacement field: `foo(...)[4:]`.
+    // The chain regex only matched a dotted NAME base, so the bound leaked
+    // into the magic tally (yt-dlp thisoldhouse.py:129).
+    "a.py": "def hint(m):\n    return m\nx = f'{hint(m=\"c\")[4:]}'\ny = f'{hint(m=\"d\")[4:]}'\nz = f'{hint(m=\"e\")[4:]}'\n",
+  },
+  quiet0133_fstring_tuple_is_data: {
+    // A tuple literal inside a replacement field names its own data: the
+    // 255 in `bytes((b & 255, )).hex()` is exempt in Python, so the flat
+    // scan must blank it too (yt-dlp cda.py:164).
+    "a.py": "a = f'{bytes((1 & 255, )).hex()}:'\nb = f'{bytes((2 & 255, )).hex()}:'\nc = f'{bytes((3 & 255, )).hex()}:'\n",
+  },
+  quiet0133_fstring_keyword_value: {
+    // A literal that is the DIRECT value of a keyword arg is named by the
+    // keyword (Python's ast.keyword is a data boundary); it must not leak
+    // (yt-dlp tiktok.py:1090 `random.choices(..., k=7)`).
+    "a.py": "import random, string\nx = f'{\"\".join(random.choices(string.hexdigits, k=7))}'\ny = f'{\"\".join(random.choices(string.hexdigits, k=7))}'\nz = f'{\"\".join(random.choices(string.hexdigits, k=7))}'\n",
+  },
+  quiet0133_keyword_ternary_in_tuple: {
+    // A keyword value that is a CONDITIONAL sits under ast.keyword, a data
+    // boundary, so Python counts its literal even when the call is inside a
+    // tuple; the JS walker walked past the keyword into the tuple
+    // (yt-dlp YoutubeDL.py:1474 `indent=4 if ... else None`).
+    "a.py": "def f(x, k):\n    return x\nc = 1\ns = 2\na = f(1, k=4 if c else None), s\nb = f(1, k=4 if c else None), s\nd = f(1, k=4 if c else None), s\n",
+  },
 };
