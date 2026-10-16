@@ -128,6 +128,27 @@ Honest about limits, like any good linter should be.
 
 ## Changelog
 
+- **0.1.33** — lifting the lid on a skip. Three JS tokenizer gaps made the
+  engine skip whole files the Python engine reads fine: `KEYWORDS` was a
+  bare `{}`, so any name colliding with an `Object.prototype` member
+  (`constructor`, `toString`, `valueOf`) tokenized as a keyword and killed
+  the file; a `from ...pkg import x` relative prefix is one ellipsis token,
+  not three dots; and `nonlocal a, b` bound only the first name. field_parity
+  fails loud on a skip, but only where it is pointed, so the JS side was
+  quietly blind on trees no one had run it against yet. Fixing the parse is
+  what mattered: with the files no longer skipped, **97 pre-existing engine
+  divergences surfaced on yt-dlp that the skips had been covering**. Closed
+  across the branch: f-string replacement fields leaking prefixed and
+  triple-quoted string contents as names (8 phantom_name errors), a
+  comprehension target binding its own name, a closure binding no longer
+  throwing a bare-name call at the module-level registry (a local `parse`
+  was matched to an unrelated module-level `parse`), and six `magic_number`
+  gaps (hex/oct/bin literals are ints; exponent/base numbers parsed whole;
+  subscripts, tuple literals and keyword values are data boundaries).
+  yt-dlp is now 84/84 byte-identical both engines; pyjwt, click, requests
+  and httpx byte-identical. Corpus 161→173 (12 new guards, each fails on
+  the pre-fix engine), unit 136/136.
+
 - **0.1.32** — the scan output gets a door. 0.1.31 put the paid offer on
   the PyPI page and the README, but the tool's own output — the one surface
   read by someone who just ran a scan and has findings in front of them —
