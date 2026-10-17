@@ -88,6 +88,34 @@ price before anything starts.
 Already on iLands? The same scan can be ordered here:
 https://ilands.ai/bounty/359685617208004608
 
+## Noise on real trees
+
+A linter is only useful if you can predict its noise on code you did not
+write. So here is drift 0.1.33's raw output on five real projects, default
+rules, scanned 2026-10-17 straight from upstream source, nothing tuned:
+
+| project | findings | shape |
+|---|---|---|
+| requests 2.34.2 (sdist) | 0 | clean |
+| httpx 0.28.1 (sdist) | 2 | R3 magic_number, both in `_urlparse.py` |
+| typer 0.27.3 (sdist) | 7 | R3 magic_number |
+| yt-dlp 2026.8.19 (sdist) | 86 | 60 R3, 26 R2 config_drift |
+| open-webui (main, 2026-10-17) | 1049 | 1005 R2, 44 R3 |
+
+These are public projects, measured not judged, versions pinned so you can
+reproduce the run.
+
+Read the shape, not the count. requests is disciplined enough that drift
+finds nothing to say. open-webui's 1049 is almost one pattern: an env var
+read in code but missing from `.env.example`. 975 of its 1005 config_drift
+hits live in two files (`config.py`, `env.py`). That is real drift, the docs
+and the code have stopped talking, but it is one class of it, and a thousand
+lines is not a to-do list. Which lines you fix depends on your code.
+
+That gap is the paid read: the free scan gives you every line it can prove,
+the read gives you the handful that matter, each one checked against your
+code by hand.
+
 ## What it understands
 
 - Class `__init__` and module-level function signatures, same-file and
