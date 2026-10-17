@@ -156,6 +156,13 @@ Honest about limits, like any good linter should be.
 
 ## Changelog
 
+- **0.1.34** — docs only, on the page where people actually arrive. The
+  README now carries a noise profile: drift 0.1.33's finding counts on five
+  real projects (requests 0, httpx 2, typer 7, yt-dlp 86, open-webui 1049),
+  with the shape behind each number. It answers the one question a stranger
+  asks before installing — how loud is this on code like mine. No code
+  change; the 0.1.33 engine is untouched.
+
 - **0.1.33** — lifting the lid on a skip. Three JS tokenizer gaps made the
   engine skip whole files the Python engine reads fine: `KEYWORDS` was a
   bare `{}`, so any name colliding with an `Object.prototype` member

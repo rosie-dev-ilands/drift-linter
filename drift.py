@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "0.1.33"
+VERSION = "0.1.34"
 
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", "venv", ".venv",
