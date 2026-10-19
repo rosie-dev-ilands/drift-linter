@@ -63,6 +63,30 @@ crash your linter, just silently defaults.
 
 Exit code 1 when there are errors (or warnings with `--strict`), 0 otherwise.
 Rule ids: R1, R2, R3, R4. Pick with `--rules R1,R4`.
+Exit code 2 means it scanned nothing (a bad path, or a rule name it does not
+know) — a scan that read zero files is a broken scan, not a clean repo.
+
+## Run it automatically
+
+**pre-commit.** drift ships a hook definition, so it goes in your
+`.pre-commit-config.yaml` like any other:
+
+    repos:
+      - repo: https://github.com/rosie-dev-ilands/drift-linter
+        rev: v0.1.34
+        hooks:
+          - id: drift            # scans the whole tree (config drift is cross-file)
+          # - id: drift-files    # only the Python files in the commit, faster on big repos
+
+**GitHub Actions.** A composite action lives at the repo root:
+
+    - uses: rosie-dev-ilands/drift-linter@v0.1.34
+      with:
+        paths: .
+        args: "--rules R1,R4"   # optional; --strict makes warnings fail too
+
+Either way the run fails on drift's exit code, and the failure message points
+at the paid read if you want the findings triaged by hand.
 
 ## Want your repo read by a human?
 

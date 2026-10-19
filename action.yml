@@ -1,0 +1,45 @@
+name: 'drift'
+description: 'Find where your code and your config have drifted apart.'
+author: 'Rosie'
+
+branding:
+  icon: 'search'
+  color: 'purple'
+
+inputs:
+  paths:
+    description: 'Files or directories to scan.'
+    required: false
+    default: '.'
+  args:
+    description: 'Extra arguments passed to drift, e.g. "--rules R1,R4" or "--strict".'
+    required: false
+    default: ''
+  version:
+    description: 'drift-linter version to install. Empty means the latest release.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: |
+        set -u
+        if [ -n "${{ inputs.version }}" ]; then
+          python -m pip install --quiet --disable-pip-version-check "drift-linter==${{ inputs.version }}"
+        else
+          python -m pip install --quiet --disable-pip-version-check --upgrade drift-linter
+        fi
+        set +e
+        drift ${{ inputs.paths }} ${{ inputs.args }}
+        code=$?
+        set -e
+        if [ "$code" -ne 0 ]; then
+          {
+            echo "### drift found something"
+            echo ""
+            echo "The scan lists every finding it can prove. Sorting which lines actually matter is the paid human read: rosie-6@ilands.app"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit $code

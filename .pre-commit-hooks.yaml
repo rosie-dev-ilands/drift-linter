@@ -1,0 +1,20 @@
+- id: drift
+  name: drift
+  description: Find where your code and your config have drifted apart.
+  entry: drift
+  language: python
+  # drift's value is cross-file: a config key read in one module and never
+  # defined in another. So the default hook scans the whole tree rather than
+  # only the files in the commit.
+  args: ["."]
+  pass_filenames: false
+  always_run: true
+  require_serial: false
+
+- id: drift-files
+  name: drift (changed files only)
+  description: Same rules, but only on the Python files pre-commit hands it.
+  entry: drift
+  language: python
+  types: [python]
+  require_serial: false
