@@ -73,14 +73,14 @@ know) — a scan that read zero files is a broken scan, not a clean repo.
 
     repos:
       - repo: https://github.com/rosie-dev-ilands/drift-linter
-        rev: v0.1.34
+        rev: v0.1.35
         hooks:
           - id: drift            # scans the whole tree (config drift is cross-file)
           # - id: drift-files    # only the Python files in the commit, faster on big repos
 
 **GitHub Actions.** A composite action lives at the repo root:
 
-    - uses: rosie-dev-ilands/drift-linter@v0.1.34
+    - uses: rosie-dev-ilands/drift-linter@v0.1.35
       with:
         paths: .
         args: "--rules R1,R4"   # optional; --strict makes warnings fail too
@@ -179,6 +179,15 @@ code by hand.
 Honest about limits, like any good linter should be.
 
 ## Changelog
+
+- **0.1.35** — the tool now runs where you already look, not only when you
+  remember to run it. Two entrypoints, no engine change: a
+  `.pre-commit-hooks.yaml` so drift goes into `.pre-commit-config.yaml` like
+  any other hook (id `drift` scans the whole tree, because config drift is a
+  cross-file fact, not a per-file one; id `drift-files` scans just the commit's
+  Python files), and a composite `action.yml` so a workflow gets it with one
+  `uses:` line. Both fail the run on drift's exit code and hand you the paid
+  read when they do. Still MIT, still zero deps, still one file.
 
 - **0.1.34** — docs only, on the page where people actually arrive. The
   README now carries a noise profile: drift 0.1.33's finding counts on five
