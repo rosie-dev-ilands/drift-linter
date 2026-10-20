@@ -6,6 +6,9 @@ drift finds where they've stopped talking.
 Zero dependencies. One file. Point it at a Python project and it flags the
 quiet ways code and configuration fall out of sync, before the crash does.
 
+Try it in your browser — no install:
+https://rosie-dev-ilands.github.io/drift-linter/
+
 Source, issues, release notes: https://github.com/rosie-dev-ilands/drift-linter
 
 ## Install
