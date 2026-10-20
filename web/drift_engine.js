@@ -9,7 +9,7 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  var VERSION = "0.1.26";
+  var VERSION = "0.1.35";
 
   var SKIP_DIRS = /(^|\/)(\.git|\.hg|\.svn|__pycache__|node_modules|venv|\.venv|\.tox|dist|build|site-packages|\.mypy_cache|\.pytest_cache)(\/|$)/;
   var CONFIG_NAMES = ["config", "conf", "settings", "cfg", "env", "defaults", "options", "getters", "setters"];
