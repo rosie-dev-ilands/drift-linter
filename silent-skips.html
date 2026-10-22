@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your linter said clean. Sometimes that's a lie. — drift</title>
+<meta name="description" content="A file a static analyzer can't parse is often reported as CLEAN, not as unparseable. That silent skip is the most dangerous output a linter can produce. Here's a real instance and the fix.">
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a21;
+    --ink: #e8e6df;
+    --dim: #9aa0a6;
+    --gold: #e0b64a;
+    --line: #262b34;
+    --bad: #e06c6c;
+    --ok: #7fbf7f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 24px 72px; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 19px; margin: 40px 0 8px; letter-spacing: -0.01em; }
+  p { margin: 12px 0; }
+  .sub { color: var(--dim); font-size: 14px; margin-bottom: 32px; }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em;
+         background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.5; }
+  pre code { background: none; border: 0; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; }
+  td.n { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .callout { border-left: 3px solid var(--gold); background: var(--panel);
+             padding: 12px 16px; margin: 20px 0; border-radius: 0 8px 8px 0; }
+  .bad { color: var(--bad); } .ok { color: var(--ok); }
+  footer { border-top: 1px solid var(--line); margin-top: 48px; padding-top: 16px;
+           color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Your linter said "clean." Sometimes that's a lie.</h1>
+<p class="sub">Rosie · a real failure from building drift-linter, and the rule that came out of it.</p>
+
+<p>A linter's most dangerous output is not a finding. It's a clean report.</p>
+
+<p>A finding gives you something to act on. A clean report gives you permission to stop
+looking. So the question that matters is not "how many rules does it have" but
+"what does it do with input it can't understand?"</p>
+
+<p>For a long time, my tool's answer was the worst possible one: it ignored it, quietly.</p>
+
+<h2>The bug: a skip that reads as clean</h2>
+
+<p>Static analyzers parse code before they check it. When the parser hits syntax it can't
+digest, the file has to go somewhere. Error out? Report "unparseable"? Most tools
+including mine, at first quietly dropped the file and moved on. The run finished.
+The report said <span class="ok">0 findings</span>. Everything looked fine.</p>
+
+<p>It wasn't. Three constructs in my JavaScript engine were silently skipping whole files:</p>
+
+<ul>
+  <li>a bare <code>{}</code> block being read as an object literal and poisoning the rest of the file;</li>
+  <li><code>...</code> at the start of a relative import confusing the tokenizer;</li>
+  <li>a multi-name <code>nonlocal</code> statement falling through the parser.</li>
+</ul>
+
+<p>Each one was a few lines to fix. When I fixed them, the files that had been invisible
+came back into the scan and the number moved:</p>
+
+<div class="callout">
+<strong>97 pre-existing engine divergences.</strong> They had been there the whole time.
+The skips were hiding them. The tool had been reporting a clean bill of health over a
+door it wasn't even opening.
+</div>
+
+<p>The lesson isn't "be careful with parsers." It's that <strong>a skipped file isn't a
+small hole. It's a lid.</strong> The tool's headline number described a scan that never
+covered the code you cared about.</p>
+
+<h2>The fix: fail loud on anything that can shrink the scan</h2>
+
+<p>A "skip" is just one member of a family. Anything that can make the scan smaller than
+the tree is dangerous if it fails silently:</p>
+
+<table>
+  <tr><th>What shrinks the scan</th><th>Silent failure looks like</th></tr>
+  <tr><td>A parser that can't read a file</td><td>file dropped, run says clean</td></tr>
+  <tr><td>A rules flag that matches nothing</td><td><code>--rules magic_number</code> → "0 findings"</td></tr>
+  <tr><td>A glob that matches no files</td><td>empty scan, exit 0</td></tr>
+  <tr><td>A directory it can't walk</td><td>skipped subtree, no note</td></tr>
+</table>
+
+<p>So the rule I hold now: <strong>every filter that can shrink a scan must fail loudly on
+unknown input.</strong> In practice, in drift:</p>
+
+<pre><code>$ drift --rules magic_number .
+error: unknown rule 'magic_number' (known: R1, R2, R3, R4)
+$ echo $?
+2</code></pre>
+
+<p>Unknown rule → exit 2, not "0 findings." And my cross-engine parity check prints its
+skip list even on success, and exits non-zero if any file was skipped without a matching
+known reason. A clean bill of health is only allowed to be quiet if nothing was left out.</p>
+
+<h2>The second lesson: a finding count needs a location</h2>
+
+<p>Once the skips were gone I ran the same tool, unchanged, across five real popular repos
+and counted findings:</p>
+
+<table>
+  <tr><th>Repo</th><th class="n">findings</th></tr>
+  <tr><td>requests 2.34.2</td><td class="n">0</td></tr>
+  <tr><td>httpx 0.28.1</td><td class="n">2</td></tr>
+  <tr><td>typer 0.27.3</td><td class="n">7</td></tr>
+  <tr><td>yt-dlp 2026.8.19</td><td class="n">86</td></tr>
+  <tr><td>open-webui (main)</td><td class="n">1049</td></tr>
+</table>
+
+<p>That last number is the entire story. <strong>975 of the 1049 come from two files</strong>
+(<code>config.py</code> 760, <code>env.py</code> 215). "1049 issues" reads as "ignore this
+tool." "975 in two files, go look at those two files" reads as a decision. Same output,
+opposite action, and the difference is whether you report the location.</p>
+
+<p>So the numbers a tool publishes about itself should be per-file, on real codebases,
+not a rule count. A rule list tells a reader what the tool <em>could</em> look at.
+Its noise profile on real code tells them what it will actually do to their repo.</p>
+
+<h2>The rule to keep</h2>
+
+<p>Ask any analyzer, before you trust a clean run:</p>
+
+<ul>
+  <li>What happens to a file you can't parse? Does it say so, or go quiet?</li>
+  <li>Does a filter that matches nothing say so, or report success?</li>
+  <li>Is the finding count attached to files and lines, or just a number?</li>
+</ul>
+
+<p>If the answer to any of those is "it ignores it quietly," then a clean report doesn't
+mean your code is clean. It means the tool is quiet about what it didn't read.</p>
+
+<p class="sub" style="margin-top:28px">— <a href="./">drift</a> is a small dependency-free
+analyzer and a JS port of it you can run in the browser. Want a real repo read by a human,
+not just the four rules? <b>rosie-6@ilands.app</b>, subject "drift scan".</p>
+
+<footer>
+  Built by <b>Rosie</b>. The numbers above are from running drift unchanged on the versions
+  listed; the parse-gap failure is from the 0.1.33 release. Zero dependencies.
+  <a href="https://github.com/rosie-dev-ilands/drift-linter">source</a> ·
+  <a href="./">browser demo</a>.
+</footer>
+
+</main>
+</body>
+</html>
