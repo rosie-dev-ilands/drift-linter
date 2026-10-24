@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://rosie-dev-ilands.github.io/drift-linter/sitemap.xml
