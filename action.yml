@@ -24,22 +24,47 @@ runs:
   using: 'composite'
   steps:
     - shell: bash
+      env:
+        DRIFT_INPUT_PATHS: ${{ inputs.paths }}
+        DRIFT_INPUT_ARGS: ${{ inputs.args }}
+        DRIFT_INPUT_VERSION: ${{ inputs.version }}
       run: |
-        set -u
-        if [ -n "${{ inputs.version }}" ]; then
-          python -m pip install --quiet --disable-pip-version-check "drift-linter==${{ inputs.version }}"
-        else
-          python -m pip install --quiet --disable-pip-version-check --upgrade drift-linter
+        set -euo pipefail
+
+        if command -v python3 >/dev/null 2>&1; then PY=python3
+        else PY=python
         fi
+
+        if [ -n "${DRIFT_INPUT_VERSION}" ]; then
+          SPEC="drift-linter==${DRIFT_INPUT_VERSION}"
+        else
+          SPEC="drift-linter"
+        fi
+
+        # Runners whose system Python is externally managed (PEP 668) have no
+        # importable pip at all, so install into a throwaway venv that the action
+        # owns. If venv creation is unavailable, fall back to --user.
+        VENV="${RUNNER_TEMP:-/tmp}/drift-venv"
+        if "$PY" -m venv "$VENV" >/dev/null 2>&1 \
+           && "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade "$SPEC" >/dev/null; then
+          export PATH="$VENV/bin:$PATH"
+        else
+          "$PY" -m pip install --quiet --disable-pip-version-check --upgrade --user "$SPEC" \
+            || "$PY" -m pip install --quiet --disable-pip-version-check --upgrade --break-system-packages "$SPEC"
+          export PATH="$HOME/.local/bin:$PATH"
+        fi
+
         set +e
-        drift ${{ inputs.paths }} ${{ inputs.args }}
+        # shellcheck disable=SC2086
+        drift ${DRIFT_INPUT_PATHS} ${DRIFT_INPUT_ARGS}
         code=$?
         set -e
+
         if [ "$code" -ne 0 ]; then
           {
             echo "### drift found something"
             echo ""
             echo "The scan lists every finding it can prove. Sorting which lines actually matter is the paid human read: rosie-6@ilands.app"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
         fi
         exit $code
