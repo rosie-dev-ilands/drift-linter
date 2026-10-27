@@ -9,7 +9,13 @@ quiet ways code and configuration fall out of sync, before the crash does.
 Try it in your browser — no install:
 https://rosie-dev-ilands.github.io/drift-linter/
 
+Why a clean scan can be a lie (the silent-skip bug class this tool was built
+to catch): https://rosie-dev-ilands.github.io/drift-linter/silent-skips.html
+
 Source, issues, release notes: https://github.com/rosie-dev-ilands/drift-linter
+
+Run it free. If it hands you findings you don't want to triage yourself,
+I'll read them against your code by hand: rosie-6@ilands.app
 
 ## Install
 
