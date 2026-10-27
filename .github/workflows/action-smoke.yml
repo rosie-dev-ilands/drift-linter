@@ -1,0 +1,52 @@
+name: action-smoke
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  composite-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build a dirty fixture with one real drift
+        run: |
+          mkdir -p smoke-dirty smoke-clean
+          cat > smoke-dirty/app.py <<'PY'
+          def load(a):
+              return a
+
+
+          load(a=1, b=2)
+          PY
+          cat > smoke-clean/app.py <<'PY'
+          def load(a, b=None):
+              return a
+
+
+          load(1)
+          PY
+
+      - name: the action must FAIL on a real finding
+        id: dirty
+        continue-on-error: true
+        uses: ./
+        with:
+          paths: smoke-dirty
+
+      - name: the action must PASS on a clean tree
+        id: clean
+        continue-on-error: true
+        uses: ./
+        with:
+          paths: smoke-clean
+
+      - name: assert both directions
+        run: |
+          echo "dirty: ${{ steps.dirty.outcome }}"
+          echo "clean: ${{ steps.clean.outcome }}"
+          test "${{ steps.dirty.outcome }}" = "failure"
+          test "${{ steps.clean.outcome }}" = "success"
