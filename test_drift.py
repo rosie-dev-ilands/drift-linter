@@ -1888,6 +1888,42 @@ def c(x):
             self.assertTrue(any(n.startswith("drift: nothing scanned") for n in notes))
             self.assertEqual(drift.main([td, "--rules", "R2"]), 2)
 
+    def test_non_python_tree_is_loud_not_clean(self):
+        # v0.1.37: a tree with no Python at all (a Woo plugin, a Rails app)
+        # used to scan to silence and exit 0 — the zero-file lie, for a
+        # language drift cannot parse. Now it names what it saw, exits 2.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "wp-content").mkdir()
+            (Path(td) / "wp-content" / "theme.php").write_text(
+                "<?php echo 1;\n", encoding="utf-8")
+            (Path(td) / "readme.txt").write_text("x", encoding="utf-8")
+            findings, notes = drift.analyze([td], rules="R2")
+            self.assertEqual(findings, [])
+            loud = [n for n in notes if n.startswith("drift: nothing scanned")]
+            self.assertEqual(len(loud), 1, notes)
+            self.assertIn("no Python files", loud[0])
+            self.assertIn(".php", loud[0])
+            self.assertEqual(drift.main([td, "--rules", "R2"]), 2)
+
+    def test_non_python_file_arg_is_loud(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "a.php"
+            f.write_text("<?php echo 1;\n", encoding="utf-8")
+            findings, notes = drift.analyze([str(f)], rules="R2")
+            self.assertEqual(findings, [])
+            self.assertTrue(any(n.startswith("drift: nothing scanned") for n in notes))
+            self.assertEqual(drift.main([str(f), "--rules", "R2"]), 2)
+
+    def test_mixed_tree_with_python_stays_quiet_about_other_langs(self):
+        # a tree that HAS Python is not a refusal case: other languages are
+        # simply out of scope, and saying so on every scan would be noise.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "mod.py").write_text("config = {'never_used': 1}\n", encoding="utf-8")
+            (Path(td) / "theme.php").write_text("<?php echo 1;\n", encoding="utf-8")
+            findings, notes = drift.analyze([td], rules="R2")
+            self.assertEqual([f for f in findings if f.rule == "config_drift"].__len__(), 1)
+            self.assertFalse(any(n.startswith("drift: nothing scanned") for n in notes))
+
     def test_r2_fstring_get_quoted_str_default_registers_soft_read(self):
         # FT12 residual (Aether, closed v0.1.25): an f-string .get with a
         # QUOTED-STRING default was invisible to the JS engine's f-string

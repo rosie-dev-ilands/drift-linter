@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -143,6 +144,13 @@ ENV_DOC_NAMES = {".env", ".env.example"}
 SPHINX_CONF_GLOBALS = {"tags"}
 
 
+def _lang_summary(counts: "Counter[str]") -> str:
+    """'12 .php, 4 .twig' — the biggest few, for a refusal note that says what
+    drift actually saw instead of pretending it saw nothing."""
+    top = counts.most_common(4)
+    return ", ".join(f"{n} {suf or '(no extension)'}" for suf, n in top)
+
+
 def _collect_project_files(paths: List[str]) -> Tuple[List[Path], List[str]]:
     """Walk inputs, applying SKIP_DIRS to root-relative path parts only.
 
@@ -151,6 +159,11 @@ def _collect_project_files(paths: List[str]) -> Tuple[List[Path], List[str]]:
     venv / .tox silently zero-scanned and reported a clean bill (review F2).
     A directory whose Python files were ALL consumed by skip dirs gets a
     loud note: a scan that reads zero files must never report clean.
+
+    Same lie, different door (v0.1.37): pointed at a tree that holds no
+    Python at all — a Woo plugin, a Rails app — drift used to print zero
+    findings and exit 0. Silence read as "clean" for a language the tool
+    cannot parse. Now it names the languages it saw and exits 2.
     """
     files: List[Path] = []
     notes: List[str] = []
@@ -159,13 +172,21 @@ def _collect_project_files(paths: List[str]) -> Tuple[List[Path], List[str]]:
         if p.is_file():
             if p.suffix == ".py" or p.name in ENV_DOC_NAMES:
                 files.append(p)
+            else:
+                notes.append(
+                    f"drift: nothing scanned: {p} is not a Python file "
+                    f"({p.suffix or 'no extension'}). drift reads Python only; "
+                    f"a scan of this file proves nothing about it."
+                )
         elif p.is_dir():
             present = 0
+            other: "Counter[str]" = Counter()
             chosen: List[Path] = []
             for f in sorted(p.rglob("*")):
                 if not f.is_file():
                     continue
                 if f.suffix != ".py" and f.name not in ENV_DOC_NAMES:
+                    other[f.suffix.lower()] += 1
                     continue
                 present += 1
                 rel = f.relative_to(p)
@@ -178,6 +199,13 @@ def _collect_project_files(paths: List[str]) -> Tuple[List[Path], List[str]]:
                     f"found but every path matched a skip dir "
                     f"(site-packages/venv/.tox/dist/...). Refine the path; "
                     f"a zero-file scan is not a clean bill."
+                )
+            elif not present and other:
+                notes.append(
+                    f"drift: nothing scanned under {p}: no Python files "
+                    f"(found {_lang_summary(other)}). drift reads Python only, "
+                    f"so it cannot speak for this tree; a zero-file scan is "
+                    f"not a clean bill."
                 )
             files.extend(chosen)
     return files, notes
