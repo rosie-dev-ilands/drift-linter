@@ -1924,6 +1924,45 @@ def c(x):
             self.assertEqual([f for f in findings if f.rule == "config_drift"].__len__(), 1)
             self.assertFalse(any(n.startswith("drift: nothing scanned") for n in notes))
 
+    def test_refusal_replaces_the_summary_line(self):
+        # v0.1.37 review fix: the refusal used to print AFTER a "0 finding(s)"
+        # summary on stdout. A reader who pipes stdout, or a CI log that cuts
+        # off at the tail, keeps the clean-looking line and loses the refusal.
+        # Now the refusal IS the summary; there is no zero line to misread.
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "theme.php").write_text("<?php echo 1;\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = drift.main([td, "--rules", "R2"])
+            text = out.getvalue()
+            self.assertEqual(code, 2)
+            self.assertNotIn("0 finding(s)", text)
+            self.assertIn("cannot speak for this tree", text)
+
+    def test_empty_dir_is_a_refusal_not_a_clean_bill(self):
+        # The same lie, one step emptier: pointing drift at an empty directory
+        # used to print "0 finding(s)" and exit 0. Zero files read is zero
+        # files read, whether the dir is full of PHP or of nothing.
+        with tempfile.TemporaryDirectory() as td:
+            findings, notes = drift.analyze([td], rules="R2")
+            self.assertEqual(findings, [])
+            loud = [n for n in notes if n.startswith("drift: nothing scanned")]
+            self.assertEqual(len(loud), 1, notes)
+            self.assertIn("found no files at all", loud[0])
+            self.assertEqual(drift.main([td, "--rules", "R2"]), 2)
+
+    def test_refusal_with_json_keeps_stdout_parseable(self):
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "app.rb").write_text("puts 1\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = drift.main([td, "--rules", "R2", "--json"])
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            self.assertIn("cannot speak for this tree", err.getvalue())
+
     def test_r2_fstring_get_quoted_str_default_registers_soft_read(self):
         # FT12 residual (Aether, closed v0.1.25): an f-string .get with a
         # QUOTED-STRING default was invisible to the JS engine's f-string

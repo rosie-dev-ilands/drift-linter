@@ -200,10 +200,16 @@ def _collect_project_files(paths: List[str]) -> Tuple[List[Path], List[str]]:
                     f"(site-packages/venv/.tox/dist/...). Refine the path; "
                     f"a zero-file scan is not a clean bill."
                 )
-            elif not present and other:
+            elif not present:
+                # No Python file means drift read nothing, and a summary line
+                # saying "0 finding(s)" over a scan of zero files is the lie
+                # this tool exists to refuse. Same rule for an empty dir as
+                # for a PHP tree: what was scanned is what we can speak for.
+                seen = (f"found {_lang_summary(other)}" if other
+                        else "found no files at all")
                 notes.append(
                     f"drift: nothing scanned under {p}: no Python files "
-                    f"(found {_lang_summary(other)}). drift reads Python only, "
+                    f"({seen}). drift reads Python only, "
                     f"so it cannot speak for this tree; a zero-file scan is "
                     f"not a clean bill."
                 )
@@ -1822,6 +1828,9 @@ def main(argv=None) -> int:
     errors = [f for f in findings if f.severity == "error"]
     warnings = [f for f in findings if f.severity == "warning"]
     failed = bool(errors) or (args.strict and bool(warnings))
+    # a scan that read zero files is misconfiguration, not a clean bill
+    # (review F2): exit 2 like the unknown-rule guard
+    refuse = [n for n in notes if n.startswith("drift: nothing scanned")]
 
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
@@ -1829,7 +1838,13 @@ def main(argv=None) -> int:
         for f in findings:
             print(f"[{f.severity}] {f.rule}  {f.file}:{f.line}")
             print(f"    {f.message}")
-        if not args.quiet:
+        if refuse:
+            # The refusal IS the summary. Printing "0 finding(s)" first and the
+            # refusal after is how a reader (or a CI log tail) takes a clean
+            # bill away from a scan that proved nothing.
+            for n in refuse:
+                print(n)
+        elif not args.quiet:
             print(f"\ndrift {VERSION}: {len(findings)} finding(s) "
                   f"({len(errors)} error(s), {len(warnings)} warning(s))")
             if findings:
@@ -1840,11 +1855,11 @@ def main(argv=None) -> int:
                       "human read: rosie-6@ilands.app")
 
     for n in notes:
+        if n in refuse and not args.json:
+            continue  # already printed on stdout as the summary
         print(n, file=sys.stderr)
 
-    # a scan that read zero files is misconfiguration, not a clean bill
-    # (review F2): exit 2 like the unknown-rule guard
-    if any(n.startswith("drift: nothing scanned") for n in notes):
+    if refuse:
         return 2
     return 1 if failed else 0
 
