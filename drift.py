@@ -340,8 +340,14 @@ def _normalize_rules(spec: str) -> Optional[List[str]]:
     return out or list(RULE_ALIASES)
 
 
-def analyze(paths: List[str], rules: str = "R1,R2,R3,R4") -> Tuple[List[Finding], List[str]]:
-    """Run drift over paths. Returns (findings, notes)."""
+def analyze(paths: List[str], rules: str = "R1,R2,R3,R4",
+            stats: Optional[dict] = None) -> Tuple[List[Finding], List[str]]:
+    """Run drift over paths. Returns (findings, notes).
+
+    Pass a dict as ``stats`` to receive what the scan actually covered
+    (files read, files it could not parse, rules that ran). The CLI uses it
+    for the opening line; callers that ignore it are unaffected.
+    """
     normalized = _normalize_rules(rules)
     if normalized is None:
         raise ValueError(
@@ -354,6 +360,11 @@ def analyze(paths: List[str], rules: str = "R1,R2,R3,R4") -> Tuple[List[Finding]
     files, collect_notes = _collect_project_files(paths)
     notes: List[str] = list(collect_notes)
 
+    if stats is not None:
+        stats["paths"] = [str(p) for p in paths]
+        stats["rules"] = list(normalized)
+        stats["unreadable"] = []
+
     trees: Dict[Path, ast.Module] = {}
     for p in files:
         if p.suffix != ".py":
@@ -361,8 +372,12 @@ def analyze(paths: List[str], rules: str = "R1,R2,R3,R4") -> Tuple[List[Finding]
         t = _parse(p)
         if t is None:
             notes.append(f"drift: skipping {p} (could not parse)")
+            if stats is not None:
+                stats["unreadable"].append(str(p))
             continue
         trees[p] = t
+    if stats is not None:
+        stats["files_read"] = len(trees)
 
     class_sigs: Dict[str, _Sig] = {}
     func_sigs: Dict[str, _Sig] = {}
@@ -1804,6 +1819,48 @@ def _check_r4(trees, findings, roots) -> None:
 
 # ---------------------------------------------------------------- CLI
 
+# Plain-language line per rule, so the opening of a scan answers "what did
+# you even check" before it answers "what did you find".
+RULE_PLAIN = {
+    "R1": "unexpected kwargs",
+    "R2": "config drift",
+    "R3": "magic numbers",
+    "R4": "phantom names",
+}
+
+
+def _headline(stats: dict) -> List[str]:
+    """Opening lines of a human scan: scope first, findings second.
+
+    A findings list answers "what is wrong", which only makes sense once the
+    reader knows what was read. This is the "why not" question a person
+    actually types, answered before the list.
+    """
+    n = stats.get("files_read", 0)
+    paths = stats.get("paths") or ["."]
+    if len(paths) <= 3:
+        scope = ", ".join(paths)
+    else:
+        scope = f"{paths[0]} and {len(paths) - 1} more path(s)"
+    checked = ", ".join(
+        f"{c} {RULE_PLAIN[c]}" if c in RULE_PLAIN else c
+        for c in stats.get("rules", [])
+    )
+    out = [
+        f"drift {VERSION}: read {n} Python file(s) in {scope}",
+        f"  checked: {checked}",
+    ]
+    unread = stats.get("unreadable") or []
+    if unread:
+        names = ", ".join(Path(u).name for u in unread[:3])
+        more = "" if len(unread) <= 3 else f" and {len(unread) - 3} more"
+        out.append(
+            f"  could not parse: {len(unread)} file(s) ({names}{more}) "
+            f"— skipped, so not cleared"
+        )
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="drift",
@@ -1824,7 +1881,8 @@ def main(argv=None) -> int:
             + ", ".join(f"{c} ({n})" for c, n in RULE_ALIASES.items())
         )
 
-    findings, notes = analyze(args.paths, rules=",".join(rules))
+    stats: dict = {}
+    findings, notes = analyze(args.paths, rules=",".join(rules), stats=stats)
     errors = [f for f in findings if f.severity == "error"]
     warnings = [f for f in findings if f.severity == "warning"]
     failed = bool(errors) or (args.strict and bool(warnings))
@@ -1835,6 +1893,13 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
     else:
+        # Scope before findings, and never over a refusal: a scan that read
+        # zero files has nothing to scope, and the refusal is the summary.
+        if not args.quiet and not refuse:
+            for line in _headline(stats):
+                print(line)
+            if findings:
+                print()
         for f in findings:
             print(f"[{f.severity}] {f.rule}  {f.file}:{f.line}")
             print(f"    {f.message}")

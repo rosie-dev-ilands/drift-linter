@@ -1989,5 +1989,92 @@ def c(x):
         self.assertIn("MISSING", r2[0].message)
 
 
+class OutputHeadlineTest(unittest.TestCase):
+    """The scan opens by saying what it read, before what it found.
+
+    The question a person actually types is "why not", not "give me a
+    linter". A findings list with no scope reads as if it covered the whole
+    tree; this makes the scope explicit and keeps a zero-finding run honest
+    about how far it looked.
+    """
+
+    def run_main(self, argv):
+        import contextlib, io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = drift.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_headline_leads_the_findings(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("config = {'never_used': 1}\n", encoding="utf-8")
+            Path(td, "b.py").write_text("x = 1\n", encoding="utf-8")
+            code, out, _err = self.run_main([td, "--rules", "R2"])
+            self.assertEqual(code, 0, out)
+            lines = out.splitlines()
+            self.assertTrue(lines[0].startswith("drift "))
+            self.assertIn("read 2 Python file(s)", lines[0])
+            self.assertIn("checked: R2 config drift", lines[1])
+            # the finding and the summary come after the scope
+            self.assertLess(out.index("read 2 Python file(s)"),
+                            out.index("1 finding(s)"))
+
+    def test_clean_run_still_says_how_far_it_looked(self):
+        # the zero-finding case is the one that most needs a scope line: it
+        # should read as "nothing in these 2 files", not "nothing anywhere"
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("x = 1\n", encoding="utf-8")
+            Path(td, "b.py").write_text("y = 2\n", encoding="utf-8")
+            code, out, _err = self.run_main([td, "--rules", "R2"])
+            self.assertEqual(code, 0, out)
+            self.assertIn("read 2 Python file(s)", out)
+            self.assertIn("0 finding(s)", out)
+
+    def test_headline_names_unparsed_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "good.py").write_text("x = 1\n", encoding="utf-8")
+            Path(td, "broken.py").write_text("def f(:\n", encoding="utf-8")
+            code, out, _err = self.run_main([td, "--rules", "R2"])
+            self.assertIn("could not parse: 1 file(s) (broken.py)", out)
+            self.assertIn("not cleared", out)
+            self.assertIn("read 1 Python file(s)", out)
+            self.assertEqual(code, 0, out)
+
+    def test_headline_is_absent_from_json(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("config = {'never_used': 1}\n", encoding="utf-8")
+            _code, out, _err = self.run_main([td, "--rules", "R2", "--json"])
+            payload = _json.loads(out)
+            self.assertIsInstance(payload, list)
+
+    def test_quiet_stays_quiet(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("config = {'never_used': 1}\n", encoding="utf-8")
+            _code, out, _err = self.run_main([td, "--rules", "R2", "--quiet"])
+            self.assertNotIn("read 1 Python file(s)", out)
+
+    def test_refusal_does_not_get_a_scope_line(self):
+        # zero files read: a "read 0 Python file(s)" line would soften the
+        # refusal into a scope note. The refusal is the whole story.
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "theme.php").write_text("<?php echo 1;\n", encoding="utf-8")
+            code, out, _err = self.run_main([td, "--rules", "R2"])
+            self.assertEqual(code, 2)
+            self.assertNotIn("read 0 Python file(s)", out)
+            self.assertIn("cannot speak for this tree", out)
+
+    def test_stats_dict_is_optional(self):
+        # callers that unpack two values (and every older test) keep working
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text("x = 1\n", encoding="utf-8")
+            findings, notes = drift.analyze([td], rules="R2")
+            self.assertEqual(findings, [])
+            stats = {}
+            drift.analyze([td], rules="R2", stats=stats)
+            self.assertEqual(stats["files_read"], 1)
+            self.assertEqual(stats["unreadable"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
