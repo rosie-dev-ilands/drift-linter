@@ -1638,8 +1638,10 @@ def c(x):
                 capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(r.returncode, 0)  # warning, not error
-            self.assertIn("7 appears 3 times", r.stdout)
-            self.assertIn("8 appears 3 times", r.stdout)
+            # v0.1.38: magic numbers are listed by file, every site shown
+            self.assertIn("magic numbers by file (2 value(s), 6 site(s))", r.stdout)
+            self.assertIn("7  x3  lines 2, 5, 8", r.stdout)
+            self.assertIn("8  x3  lines 2, 5, 8", r.stdout)
 
     def test_cli_rules_unknown_name_fails_loudly(self):
         # The footgun this guards: --rules bogus used to scan nothing and
@@ -2039,6 +2041,61 @@ class OutputHeadlineTest(unittest.TestCase):
             self.assertIn("not cleared", out)
             self.assertIn("read 1 Python file(s)", out)
             self.assertEqual(code, 0, out)
+
+    def test_magic_numbers_are_listed_by_file_with_every_site(self):
+        # Lefty's read (11-14): the value matters less than where it sits.
+        # One flat bullet per value said "7 appears 45 times (3 samples)";
+        # a developer wants each file, each line, under the file it lives in.
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text(
+                "def f(x):\n    return x + 3600\n" * 1
+                + "def g(x):\n    return x + 3600\n"
+                + "def h(x):\n    return x + 3600\n",
+                encoding="utf-8",
+            )
+            Path(td, "b.py").write_text(
+                "def i(x):\n    return x + 3600\n",
+                encoding="utf-8",
+            )
+            code, out, _err = self.run_main([td, "--rules", "R3"])
+            self.assertEqual(code, 0, out)
+            self.assertIn("magic numbers by file (1 value(s), 4 site(s)):", out)
+            self.assertLess(out.index("a.py"), out.index("b.py"))
+            self.assertIn("3600  x3  lines 2, 4, 6", out)
+            self.assertIn("3600  x1  line 2", out)
+
+    def test_grouped_magic_keeps_other_findings_flat(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text(
+                "class Foo:\n    def __init__(self, a):\n        pass\n"
+                "f = Foo(b=1)\n"
+                "def g(x):\n    return x + 3600\n"
+                "def h(x):\n    return x + 3600\n"
+                "def i(x):\n    return x + 3600\n",
+                encoding="utf-8",
+            )
+            code, out, _err = self.run_main([td, "--rules", "R1,R3"])
+            self.assertEqual(code, 1, out)
+            self.assertIn("[error] unexpected_kwarg  ", out)
+            self.assertIn("magic numbers by file (1 value(s), 3 site(s)):", out)
+            # the R1 bullet stays a bullet; the R3 value gets no flat bullet
+            self.assertNotIn("3600 appears 3 times", out)
+
+    def test_grouped_magic_has_no_extra_json_fields(self):
+        # locations/label are human-output shape; engine parity compares
+        # to_dict, so the JSON schema must not move (v0.1.38).
+        import json as _json
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "a.py").write_text(
+                "def f(x):\n    return x + 3600\n"
+                "def g(x):\n    return x + 3600\n"
+                "def h(x):\n    return x + 3600\n",
+                encoding="utf-8",
+            )
+            _code, out, _err = self.run_main([td, "--rules", "R3", "--json"])
+            payload = _json.loads(out)
+            self.assertEqual(set(payload[0]), {"rule", "severity", "file", "line", "message"})
+            self.assertNotIn("magic numbers by file", out)
 
     def test_headline_is_absent_from_json(self):
         import json as _json

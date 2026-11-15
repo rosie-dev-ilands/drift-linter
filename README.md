@@ -57,9 +57,19 @@ warnings, not errors — that's a documented default, not a silent one.
 
 **R3 magic_number** — bare numbers doing a named constant's job. `0.4` three
 times is a margin that escaped; it should have a name and a config key.
-Int literals report as ints (`7 appears 3 times`, not `7.0`); repetition
-inside test files is skipped — vectors and fixtures are data, not
-unnamed constants.
+Int literals report as ints, not floats; repetition inside test files is
+skipped — vectors and fixtures are data, not unnamed constants. The human
+output lists them by file with every line, so a number you half-remember
+from last week is one `grep`-free glance away:
+
+    magic numbers by file (2 value(s), 6 site(s)):
+      app.py
+        3600  x3  lines 12, 40, 91
+        0.4   x1  line 55
+      util.py
+        3600  x2  lines 8, 30
+
+`--json` is unchanged: one finding per value, the same fields as before.
 
 **R4 phantom_name** — names used but never defined. The typo that doesn't
 crash your linter, just silently defaults.
@@ -82,14 +92,14 @@ know) — a scan that read zero files is a broken scan, not a clean repo.
 
     repos:
       - repo: https://github.com/rosie-dev-ilands/drift-linter
-        rev: v0.1.35
+        rev: v0.1.38
         hooks:
           - id: drift            # scans the whole tree (config drift is cross-file)
           # - id: drift-files    # only the Python files in the commit, faster on big repos
 
 **GitHub Actions.** A composite action lives at the repo root:
 
-    - uses: rosie-dev-ilands/drift-linter@v0.1.35
+    - uses: rosie-dev-ilands/drift-linter@v0.1.38
       with:
         paths: .
         args: "--rules R1,R4"   # optional; --strict makes warnings fail too
@@ -188,6 +198,32 @@ code by hand.
 Honest about limits, like any good linter should be.
 
 ## Changelog
+
+- **0.1.38** — the output now answers the question a developer actually
+  asks. Magic numbers are listed **by file, with every site**, under the
+  file they live in, instead of one flat bullet per repeated value: the
+  finding said "7 appears 45 times (3 samples)", which tells you the size
+  of the problem and not where to look. One real user's read (a working
+  web dev running it on his own tree): the value of the tool is being
+  *told* where the loose numbers are, because after a long build you
+  forget, and seeing them makes the difference. `--json` is byte-for-byte
+  the same schema; only the human listing changed. Engine untouched.
+
+- **0.1.37** — a language drift cannot read is now a refusal, not a clean
+  bill. Pointed at a PHP/Woo tree with no Python, drift used to print
+  `0 finding(s)` and exit 0, which reads exactly like "your code is fine".
+  Now a scan that read zero Python files names the languages it did see
+  and exits 2: `drift reads Python only, so it cannot speak for this
+  tree`. The refusal replaces the summary on stdout (it used to print
+  after a `0 finding(s)` line, where a pipe or a CI log tail could drop
+  it); an empty directory refuses the same way. `--json` stdout stays
+  parseable.
+
+- **0.1.36** — the GitHub Action actually runs on a runner. 0.1.35's
+  composite action called a bare `python -m pip`, which dies on PEP 668
+  runners before drift ever starts. It now builds its own venv, pins by
+  tag, and the tag tree is the tree that was tested. Local-green is not
+  runner-green.
 
 - **0.1.35** — the tool now runs where you already look, not only when you
   remember to run it. Two entrypoints, no engine change: a

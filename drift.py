@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "0.1.37"
+VERSION = "0.1.38"
 
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", "venv", ".venv",
@@ -118,6 +118,11 @@ class Finding:
     file: str
     line: int
     message: str
+    # Every site of a magic-number family, and the value it belongs to. Not in
+    # to_dict: engine parity compares the finding's public fields, and the
+    # grouped listing is a human-output shape (v0.1.38).
+    locations: List[Tuple[str, int]] = field(default_factory=list)
+    label: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -1646,6 +1651,8 @@ def _check_r3(trees, findings) -> None:
             findings.append(Finding(
                 "magic_number", "warning", locs[0][0], locs[0][1],
                 f"{shown} appears {len(locs)} times ({samples}). Hardcoded value doing a named constant's job.",
+                locations=[(f, l) for f, l, _ in locs],
+                label=shown,
             ))
 
 
@@ -1861,6 +1868,41 @@ def _headline(stats: dict) -> List[str]:
     return out
 
 
+def _print_magic_by_file(magic: List[Finding], cap: int = 10) -> None:
+    """List magic numbers by file, with every site under the file it lives in.
+
+    The flat finding says "7 appears 45 times (3 samples)", which answers
+    "how bad" and not "where are they" — the question a developer asks after
+    a long build, when they remember a number exists and not which file it
+    sits in (Lefty's read, 11-14: "seeing them makes all the difference").
+    """
+    groups: Dict[str, Dict[str, List[int]]] = {}
+    labels: Set[str] = set()
+    sites = 0
+    for f in magic:
+        label = f.label or f.message.split(" appears ", 1)[0]
+        labels.add(label)
+        locs = f.locations or [(f.file, f.line)]
+        sites += len(locs)
+        for path, line in locs:
+            groups.setdefault(path, {}).setdefault(label, []).append(line)
+    width = max((len(lb) for lb in labels), default=0)
+    print(f"magic numbers by file ({len(labels)} value(s), {sites} site(s)):")
+    for path in sorted(groups):
+        print(f"  {path}")
+        entries = sorted(
+            ((min(lines), label, sorted(lines))
+             for label, lines in groups[path].items()),
+            key=lambda e: (e[0], e[1]),
+        )
+        for _first, label, lines in entries:
+            word = "line" if len(lines) == 1 else "lines"
+            shown = ", ".join(str(l) for l in lines[:cap])
+            if len(lines) > cap:
+                shown += f", +{len(lines) - cap} more"
+            print(f"    {label.ljust(width)}  x{len(lines)}  {word} {shown}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="drift",
@@ -1900,9 +1942,18 @@ def main(argv=None) -> int:
                 print(line)
             if findings:
                 print()
+        # Magic numbers answer "where are they", so they are listed by file
+        # with every site, not as one flat bullet per value.
+        magic = [f for f in findings if f.rule == "magic_number"]
         for f in findings:
+            if f.rule == "magic_number":
+                continue
             print(f"[{f.severity}] {f.rule}  {f.file}:{f.line}")
             print(f"    {f.message}")
+        if magic:
+            if len(magic) < len(findings):
+                print()
+            _print_magic_by_file(magic)
         if refuse:
             # The refusal IS the summary. Printing "0 finding(s)" first and the
             # refusal after is how a reader (or a CI log tail) takes a clean
