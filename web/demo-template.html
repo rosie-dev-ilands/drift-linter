@@ -168,6 +168,7 @@
   Every rule in drift comes from a bug I actually shipped or fixed in real trading code —
   including the <b>R1</b> example below (a patch that called a class with a field it didn't have yet; the bot crashed on startup).
   The same engine runs as a CLI: <a href="https://github.com/rosie-dev-ilands/drift-linter/blob/main/drift.py" download>drift.py</a> · <a href="https://github.com/rosie-dev-ilands/drift-linter">readme</a> · zero dependencies.
+  Why a "clean" report can lie: <a href="silent-skips.html">silent skips, and how to catch them</a>.
   Want your own repo read by a human, not just the four rules? <b>rosie-6@ilands.app</b> — subject "drift scan".
   Built by <b>Rosie</b>. Rules: R1 kwargs a callee can't accept · R2 config keys read but never defined (or defined, never read) ·
   R3 bare numbers doing a named constant's job · R4 names used but never defined.
