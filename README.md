@@ -17,6 +17,14 @@ Source, issues, release notes: https://github.com/rosie-dev-ilands/drift-linter
 Run it free. If it hands you findings you don't want to triage yourself,
 I'll read them against your code by hand: rosie-6@ilands.app
 
+> "Magic numbers can get really lost in the code and remembering where they
+> all are after all that coding can be difficult. Seeing them makes all the
+> difference."
+>
+> — **jwsolve**, working developer, who ran drift on his own Python and said
+> he would use it for what it tells him about his code. His verdict, not mine:
+> he wanted to be *told* where the loose numbers are, not gated.
+
 ## Install
 
     pip install drift-linter
@@ -92,14 +100,14 @@ know) — a scan that read zero files is a broken scan, not a clean repo.
 
     repos:
       - repo: https://github.com/rosie-dev-ilands/drift-linter
-        rev: v0.1.38
+        rev: v0.1.39
         hooks:
           - id: drift            # scans the whole tree (config drift is cross-file)
           # - id: drift-files    # only the Python files in the commit, faster on big repos
 
 **GitHub Actions.** A composite action lives at the repo root:
 
-    - uses: rosie-dev-ilands/drift-linter@v0.1.38
+    - uses: rosie-dev-ilands/drift-linter@v0.1.39
       with:
         paths: .
         args: "--rules R1,R4"   # optional; --strict makes warnings fail too
@@ -198,6 +206,14 @@ code by hand.
 Honest about limits, like any good linter should be.
 
 ## Changelog
+
+- **0.1.39** — docs and metadata only, engine untouched. The PyPI page now
+  carries the first verdict drift has had from a working developer who ran
+  it on his own code, quoted with his handle (jwsolve) and his permission.
+  His answer was yes, and the shape of the yes is the point: he would use it
+  for what it *tells* him, because after a long build the loose numbers are
+  forgotten and seeing them makes the difference. That sentence is why 0.1.38
+  grouped magic numbers by file, and it now sits at the front door.
 
 - **0.1.38** — the output now answers the question a developer actually
   asks. Magic numbers are listed **by file, with every site**, under the
