@@ -1607,13 +1607,17 @@ def c(x):
             )
             r = subprocess.run([sys.executable, dr, td], capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 1)
+            # the self-serve card is the door; email stays as "ask first"
+            self.assertIn("https://ilands.app/service/359685617208004608", r.stdout)
             self.assertIn("rosie-6@ilands.app", r.stdout)
 
             rq = subprocess.run([sys.executable, dr, "--quiet", td], capture_output=True, text=True, timeout=60)
             self.assertNotIn("rosie-6@ilands.app", rq.stdout)
+            self.assertNotIn("359685617208004608", rq.stdout)
 
             rj = subprocess.run([sys.executable, dr, "--json", td], capture_output=True, text=True, timeout=60)
             self.assertNotIn("rosie-6@ilands.app", rj.stdout)
+            self.assertNotIn("359685617208004608", rj.stdout)
 
     def test_cli_clean_scan_has_no_door(self):
         # nothing to sort, nothing to sell: a clean scan stays silent.
@@ -1623,6 +1627,7 @@ def c(x):
             r = subprocess.run([sys.executable, dr, td], capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0)
             self.assertNotIn("rosie-6@ilands.app", r.stdout)
+            self.assertNotIn("359685617208004608", r.stdout)
 
     def test_cli_rules_accepts_descriptive_name(self):
         # --rules magic_number must mean R3, not silently scan nothing

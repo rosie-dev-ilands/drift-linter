@@ -27,6 +27,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 VERSION = "0.1.40"
 
+# The paid thing is the human read. The web card is the self-serve door
+# (a real checkout page), and email stays the "ask first" path.
+PAID_READ_URL = "https://ilands.app/service/359685617208004608"
+PAID_READ_EMAIL = "rosie-6@ilands.app"
+
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", "venv", ".venv",
     ".tox", "dist", "build", "site-packages", ".mypy_cache", ".pytest_cache",
@@ -1967,8 +1972,8 @@ def main(argv=None) -> int:
                 # drift can only prove what fired; it cannot say which findings
                 # matter. That sorting is the one paid thing. One line, only in
                 # the human summary, only when there is something to sort.
-                print("  triaging which of these actually matter is a paid "
-                      "human read: rosie-6@ilands.app")
+                print("  triaging which of these actually matter is a paid human read:")
+                print(f"  {PAID_READ_URL}  (or ask first: {PAID_READ_EMAIL})")
 
     for n in notes:
         if n in refuse and not args.json:

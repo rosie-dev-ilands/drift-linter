@@ -64,7 +64,8 @@ runs:
           {
             echo "### drift found something"
             echo ""
-            echo "The scan lists every finding it can prove. Sorting which lines actually matter is the paid human read: rosie-6@ilands.app"
+            echo "The scan lists every finding it can prove. Sorting which lines actually matter is the paid human read."
+            echo "Self-serve: https://ilands.app/service/359685617208004608  (or ask first: rosie-6@ilands.app)"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
         fi
         exit $code
